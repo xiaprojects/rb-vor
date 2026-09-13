@@ -1,0 +1,11 @@
+# RTL-SDR devices, accessible to the plugdev group.
+# Installed by install.sh to /etc/udev/rules.d/99-rb-vor-sdr.rules
+#
+# Realtek RTL2832U based dongles, including the RTL-SDR Blog V3/V4 and Nooelec
+# NESDR family. Without this the daemon would need root to open the device,
+# which it must not.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2832", MODE="0660", GROUP="plugdev", SYMLINK+="rtl_sdr"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", MODE="0660", GROUP="plugdev", SYMLINK+="rtl_sdr"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2831", MODE="0660", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00a9", MODE="0660", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1554", ATTRS{idProduct}=="5020", MODE="0660", GROUP="plugdev"

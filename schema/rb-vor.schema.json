@@ -1,0 +1,556 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rbavionics.com/schema/rb-vor.schema.json",
+  "title": "RB-VOR daemon configuration",
+  "description": "Every tunable lives here; nothing in rbvor/ hardcodes a constant. additionalProperties is false throughout on purpose: a mistyped key that is silently ignored is the most expensive kind of configuration bug, because the daemon runs happily with a value the operator thinks they set.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "bridge",
+    "publish",
+    "sdr",
+    "dsp",
+    "bearing",
+    "quality",
+    "frequency",
+    "record",
+    "log"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+$"
+    },
+    "bridge": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ws_url": {
+          "type": "string",
+          "pattern": "^wss?://"
+        },
+        "rest_url": {
+          "type": "string",
+          "pattern": "^https?://"
+        },
+        "ws_reconnect_min_s": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 60
+        },
+        "ws_reconnect_max_s": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 600
+        },
+        "ws_grace_s": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 300
+        },
+        "http_timeout_s": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 30
+        }
+      },
+      "required": [
+        "http_timeout_s",
+        "rest_url",
+        "ws_grace_s",
+        "ws_reconnect_max_s",
+        "ws_reconnect_min_s",
+        "ws_url"
+      ]
+    },
+    "publish": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "periodic",
+            "on_change"
+          ]
+        },
+        "period_s": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 60
+        },
+        "deadband_deg": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 45
+        },
+        "keepalive_s": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 300
+        },
+        "hold_s": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 60
+        },
+        "signal_scale": {
+          "enum": [
+            "percent",
+            "boolean"
+          ],
+          "description": "open item O3 -- confirm against the bridge"
+        },
+        "bearing_ref": {
+          "enum": [
+            "from",
+            "to"
+          ],
+          "description": "open item O4 -- confirm against the bridge"
+        }
+      },
+      "required": [
+        "bearing_ref",
+        "deadband_deg",
+        "hold_s",
+        "keepalive_s",
+        "mode",
+        "period_s",
+        "signal_scale"
+      ]
+    },
+    "sdr": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "driver": {
+          "enum": [
+            "soapy",
+            "pyrtlsdr",
+            "rtl_sdr",
+            "file"
+          ]
+        },
+        "device_args": {
+          "type": "string"
+        },
+        "sample_rate_hz": {
+          "type": "integer",
+          "minimum": 32000,
+          "maximum": 3200000,
+          "multipleOf": 32000,
+          "description": "must divide to the 32 kHz intermediate rate"
+        },
+        "tuner_offset_hz": {
+          "type": "integer",
+          "minimum": -1600000,
+          "maximum": 1600000
+        },
+        "gain_mode": {
+          "enum": [
+            "manual",
+            "agc"
+          ]
+        },
+        "gain_db": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 60
+        },
+        "ppm": {
+          "type": "integer",
+          "minimum": -200,
+          "maximum": 200
+        },
+        "bias_tee": {
+          "type": "boolean"
+        },
+        "swap_iq": {
+          "type": "boolean",
+          "description": "conjugate IQ to un-mirror a spectrally-flipped band; some RTL-SDR setups mirror the spectrum so the signal lands on the wrong side of centre"
+        },
+        "settle_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5000
+        },
+        "buffer_blocks": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 1024
+        },
+        "block_samples": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 1048576
+        }
+      },
+      "required": [
+        "bias_tee",
+        "block_samples",
+        "buffer_blocks",
+        "device_args",
+        "driver",
+        "gain_db",
+        "gain_mode",
+        "ppm",
+        "sample_rate_hz",
+        "settle_ms",
+        "tuner_offset_hz"
+      ]
+    },
+    "dsp": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "channel_lp_hz": {
+          "type": "number",
+          "minimum": 4000,
+          "maximum": 16000
+        },
+        "channel_taps": {
+          "type": "integer",
+          "minimum": 15,
+          "maximum": 2047
+        },
+        "subcarrier_hz": {
+          "type": "number",
+          "minimum": 8000,
+          "maximum": 12000
+        },
+        "sub_lp_hz": {
+          "type": "number",
+          "minimum": 600,
+          "maximum": 1999,
+          "description": "amendment A9: must stay below the 4 kHz demod Nyquist"
+        },
+        "sub_taps": {
+          "type": "integer",
+          "minimum": 15,
+          "maximum": 1023
+        },
+        "tone_lp_hz": {
+          "type": "number",
+          "minimum": 40,
+          "maximum": 400
+        },
+        "tone_taps": {
+          "type": "integer",
+          "minimum": 15,
+          "maximum": 1023
+        },
+        "tone_hz": {
+          "type": "number",
+          "minimum": 25,
+          "maximum": 35
+        },
+        "agc_tau_s": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 10
+        },
+        "integration_s": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 10
+        },
+        "hop_s": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 10
+        },
+        "noise_bins_hz": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 8,
+          "items": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 200
+          }
+        },
+        "_note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "channel_lp_hz",
+        "channel_taps",
+        "subcarrier_hz",
+        "sub_lp_hz",
+        "sub_taps",
+        "tone_lp_hz",
+        "tone_taps",
+        "tone_hz",
+        "agc_tau_s",
+        "integration_s",
+        "hop_s",
+        "noise_bins_hz"
+      ]
+    },
+    "bearing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "phase_sign": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "enum": [
+            1,
+            -1,
+            null
+          ],
+          "description": "amendment A2: null until measured"
+        },
+        "phase_offset_deg": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -360,
+          "maximum": 360
+        },
+        "station_cal_deg": {
+          "type": "number",
+          "minimum": -360,
+          "maximum": 360
+        },
+        "smooth_n": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60
+        }
+      },
+      "required": [
+        "phase_offset_deg",
+        "phase_sign",
+        "smooth_n",
+        "station_cal_deg"
+      ]
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "weights": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "am": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "sub": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "snr": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "stab": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          },
+          "required": [
+            "am",
+            "snr",
+            "stab",
+            "sub"
+          ]
+        },
+        "am_nominal_depth": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "sub_nominal_depth": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "snr_lo_db": {
+          "type": "number",
+          "minimum": -20,
+          "maximum": 100
+        },
+        "snr_hi_db": {
+          "type": "number",
+          "minimum": -20,
+          "maximum": 120
+        },
+        "stab_full_deg": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 180
+        },
+        "flag_sub_threshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "flag_am_threshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "flag_stab_threshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "history": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 60
+        }
+      },
+      "required": [
+        "am_nominal_depth",
+        "flag_am_threshold",
+        "flag_stab_threshold",
+        "flag_sub_threshold",
+        "history",
+        "snr_hi_db",
+        "snr_lo_db",
+        "stab_full_deg",
+        "sub_nominal_depth",
+        "weights"
+      ]
+    },
+    "frequency": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "min_mhz": {
+          "type": "number",
+          "minimum": 100,
+          "maximum": 140
+        },
+        "max_mhz": {
+          "type": "number",
+          "minimum": 100,
+          "maximum": 140
+        },
+        "grid_khz": {
+          "type": "integer",
+          "enum": [
+            25,
+            50,
+            100
+          ]
+        },
+        "snap_tolerance_khz": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 25
+        },
+        "debounce_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5000
+        },
+        "allowlist_mhz": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "minimum": 100,
+            "maximum": 140
+          }
+        },
+        "denylist_mhz": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "minimum": 100,
+            "maximum": 140
+          }
+        }
+      },
+      "required": [
+        "allowlist_mhz",
+        "debounce_ms",
+        "denylist_mhz",
+        "grid_khz",
+        "max_mhz",
+        "min_mhz",
+        "snap_tolerance_khz"
+      ]
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "dir": {
+          "type": "string",
+          "minLength": 1
+        },
+        "format": {
+          "enum": [
+            "cu8",
+            "cs8",
+            "cs16",
+            "cf32"
+          ],
+          "description": "amendment A4: RTL-SDR native is cu8, not cs8"
+        },
+        "max_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 3600
+        },
+        "trigger": {
+          "enum": [
+            "on_flag",
+            "manual",
+            "always"
+          ]
+        }
+      },
+      "required": [
+        "dir",
+        "enabled",
+        "format",
+        "max_seconds",
+        "trigger"
+      ]
+    },
+    "log": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "enum": [
+            "DEBUG",
+            "INFO",
+            "WARNING",
+            "ERROR"
+          ]
+        },
+        "solution_csv": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "level",
+        "solution_csv"
+      ]
+    }
+  }
+}

@@ -1,0 +1,208 @@
+# RB-VOR-IF v2.0 — published interface specification
+
+**Status:** superseded by [`RB-VOR-IF-v2.1.md`](RB-VOR-IF-v2.1.md) · **Version:** 2.0 · **Date:** 2026-07-24
+**Producer:** RB-VOR software VOR receiver · **Platform:** RB-Avionics
+
+This document is self-contained. A third party implementing a consumer needs
+nothing else.
+
+---
+
+## 1. Overview
+
+RB-VOR decodes a VHF Omnidirectional Range station from an RTL-SDR and publishes
+the radial and a signal-quality figure into the RB-Avionics bridge.
+
+| Direction | Transport | Endpoint | Role |
+|---|---|---|---|
+| consumed | WebSocket | `ws://localhost/bridge` | RB-VOR is a read-only client |
+| produced | HTTP POST | `http://localhost/bridgeUpdate` | one JSON object per update |
+
+Hosts and paths are configurable; the shapes below are not.
+
+> **Safety.** RB-VOR is supplemental / non-required equipment. Day VFR
+> situational awareness only. Not a certified NAV receiver, not for IFR
+> navigation or approach guidance. Independent primary navigation is assumed
+> present.
+
+---
+
+## 2. Consumed — WebSocket
+
+RB-VOR connects as a client and sends no frames except protocol pings. Each
+inbound frame is a UTF-8 JSON object.
+
+| Field | Type | Unit | Range | Use |
+|---|---|---|---|---|
+| `vorfreq` | number \| null | MHz | 108.000–117.950 | tuning command |
+| `gpsTrack` | number | ° true | 0–359 | **diagnostics and logging only in v1.0** |
+
+Every other field is ignored, including `vorradial`, `vorsnr` and `voram`,
+which are echoes of RB-VOR's own output.
+
+### 2.1 `vorfreq` — three distinct cases
+
+| Case | Meaning |
+|---|---|
+| **absent** | no change; keep the current channel |
+| **`null`** | no channel selected; release and go idle |
+| **present, numeric** | tune this channel |
+| **present, non-numeric** | frame is malformed; dropped, channel unchanged |
+
+Conflating any two of these is a defect. A malformed frame is dropped and
+logged; it does not close the connection.
+
+### 2.2 Channel validation
+
+A frequency is accepted only if all of the following hold.
+
+| # | Rule |
+|---|---|
+| 1 | 108.000 ≤ f ≤ 117.950 MHz |
+| 2 | f lands on the 50 kHz grid (±1 kHz tolerance) |
+| 3 | 108.000–111.950: **VOR only if the 100 kHz digit is even.** An odd digit is an ILS localiser and is rejected. |
+| 4 | 112.000–117.950: every 50 kHz channel is a VOR channel |
+
+Examples: `109.40` ✅ · `109.50` ❌ localiser · `108.05` ✅ · `108.15` ❌ ·
+`113.35` ✅ · `117.975` ❌ off-grid · `118.00` ❌ out of band.
+
+Rejection produces one all-zero payload (`vorradial=0, vorsnr=0, voram=0`) and no retune.
+
+### 2.3 Repetition
+
+A bridge may re-assert its state at any rate. Repeating the **same** `vorfreq`
+is a no-op at any point, including mid-retune. Producers need not deduplicate.
+
+### 2.4 Reconnection
+
+RB-VOR reconnects with exponential backoff (0.5 s → 30 s). After the
+configured grace period without a connection it releases the SDR and goes idle
+rather than continue transmitting to a bridge it can no longer hear from.
+
+---
+
+## 3. Produced — HTTP POST
+
+```
+POST /bridgeUpdate
+Content-Type: application/json
+
+{ "vorradial": 130, "vorsnr": 42, "voram": 28 }
+```
+
+Encoding: UTF-8 JSON.
+
+| Field | Type | Unit | Range | Semantics |
+|---|---|---|---|---|
+| `vorradial` | integer | ° magnetic | 0–359 | radial **FROM** the station |
+| `vorsnr` | integer | dB | 0–120 | 30 Hz tone signal-to-noise ratio |
+| `voram` | integer | — | 0–100 | 30 Hz AM depth ×100 (0.28 → 28) |
+
+**The payload contains exactly these three keys.** All are always present. All
+are JSON integers, never strings, never floats, never null.
+
+### 3.1 `vorradial`
+
+Radial **from** the station, degrees magnetic, 0 = magnetic north. A consumer
+needing bearing-to computes `(vorradial + 180) % 360`. RB-VOR can be configured
+to publish bearing-to directly (`publish.bearing_ref: "to"`); v2.0 default is
+**from**.
+
+### 3.2 `vorsnr` and `voram`
+
+`vorsnr` is the measured 30 Hz reference-tone SNR in whole dB; `voram` is the
+measured 30 Hz AM modulation depth scaled ×100 (nominal healthy signal ≈ 30).
+Together they describe signal quality: a usable bearing typically has
+`vorsnr` ≳ 15 and `voram` ≳ 15. They are measurements, not a 0–100 quality
+score — a consumer decides its own usability threshold.
+
+### 3.3 The all-zero (no-signal) payload
+
+**Whenever there is no valid bearing, all three fields are 0:**
+
+```
+{ "vorradial": 0, "vorsnr": 0, "voram": 0 }
+```
+
+This is sent when the tuned frequency is **out of the airband / not a valid VOR
+channel**, when the NAV flag is raised (weak or absent signal), during retune,
+and when idle. A consumer treats `vorsnr == 0 && voram == 0` as **no valid
+signal — ignore `vorradial`.**
+
+### 3.4 Update rate — transmit on change
+
+RB-VOR sends a POST **only when at least one of the three fields changes** from
+the last value sent. A steady signal produces no traffic. An optional keep-alive
+(`publish.keepalive_s`, default 5 s) re-sends the current payload periodically so
+a consumer can distinguish a steady reading from a dead daemon; set it to 0 to
+disable and send purely on change.
+
+Every state transition (retune, flag raised or cleared, going out of band)
+changes the payload and is therefore sent immediately.
+
+## 4. Consumer requirements
+
+These are normative. A consumer that does not do these things is not conforming.
+
+1. **Treat `vorradial` as invalid whenever `vorsnr == 0 && voram == 0`.** Do not
+   display it, do not smooth through it, do not feed it to an autopilot.
+2. **Apply an independent staleness timeout**, 3 s recommended. RB-VOR's own
+   timeout does not protect against a dead process or a broken network. This
+   matters more in v2.0 than v1.0: since updates are sent only on change, a
+   consumer must not confuse "no traffic" with "still valid" -- use the
+   keep-alive interval as the staleness bound if `publish.keepalive_s` is set.
+3. **Do not assume monotonic time between updates.** Retunes and transitions
+   produce out-of-band POSTs, and a steady signal produces none at all.
+4. **Handle the 359 → 0 wrap** with circular arithmetic. A linear average of
+   359 and 1 gives 180, which points the aircraft the wrong way.
+5. **Ignore unknown fields.** v2.x may add them.
+
+---
+
+## 5. Behaviour reference
+
+| RB-VOR state | Publishes | Consumer sees |
+|---|---|---|
+| IDLE | all zero | no channel selected |
+| INVALID_FREQ / out of airband | all zero, once | frequency rejected (requirement 4) |
+| TUNING | all zero, **before the tuner moves** | previous bearing already invalidated |
+| ACQUIRING | all zero, sent once | settling |
+| TRACKING | bearing + value ≥ 40 | usable |
+| DEGRADED | bearing + value 1–39 | usable but poor |
+| DEGRADED | usable radial + real vorsnr/voram | usable but poor |
+| NO_SIGNAL | all zero | invalid; per requirement 4 |
+
+The ordering guarantee that matters: **a flag is always published before the
+tuner moves**, so no bearing from a previous station can be mistaken for the
+new one.
+
+---
+
+## 6. Versioning
+
+- Additive fields only within v2.x. Reserved for future use: `vorident`,
+  `vorto`, `vorcdi`.
+- Any change to the meaning, unit or range of `vorradial`, `vorsnr` or `voram` is a
+  **breaking change**, requiring v3.0 and a migration note.
+- Consumers must ignore unknown fields rather than reject the payload.
+- **v1.0 → v2.0 migration**: `vordir` renamed to `vorradial` (unchanged
+  semantics: radial FROM the station). `vorsignal` (a synthetic 0–100 quality
+  score) replaced by two measured quantities, `vorsnr` (dB) and `voram`
+  (AM depth ×100); a v1.0 consumer computing "usable" as `vorsignal > 0` should
+  now use `vorsnr > 0 || voram > 0` — equivalently, the daemon guarantees both
+  are 0 together whenever there is no valid solution, so either alone suffices.
+  The `signal_scale` config option (percent/boolean) no longer applies; there is
+  no synthetic quality score on the wire in v2.0.
+
+## 7. Conformance testing
+
+`tools/mock_bridge.py` implements this specification on both sides. Point it at
+a consumer, or run the daemon against it; it validates every payload and reports
+any deviation from §3.
+
+```
+tools/mock_bridge.py --port 8099 --script "109.4@0,109.5@10,113.35@20,null@30"
+```
+
+The script above exercises: a valid channel, a rejected localiser, a retune,
+and a release.

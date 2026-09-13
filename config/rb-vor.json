@@ -1,0 +1,98 @@
+{
+  "$schema": "./schema/rb-vor.schema.json",
+  "version": "1.0",
+  "bridge": {
+    "ws_url": "ws://192.168.10.1/bridge/float/ws",
+    "rest_url": "http://192.168.10.1/bridge/float",
+    "ws_reconnect_min_s": 0.5,
+    "ws_reconnect_max_s": 30.0,
+    "ws_grace_s": 5.0,
+    "http_timeout_s": 0.8
+  },
+  "publish": {
+    "mode": "periodic",
+    "period_s": 1.0,
+    "deadband_deg": 1,
+    "keepalive_s": 5.0,
+    "hold_s": 3.0,
+    "signal_scale": "percent",
+    "bearing_ref": "from"
+  },
+  "sdr": {
+    "driver": "pyrtlsdr",
+    "device_args": "driver=rtlsdr",
+    "sample_rate_hz": 1024000,
+    "tuner_offset_hz": -256000,
+    "gain_mode": "manual",
+    "gain_db": 14.4,
+    "ppm": 2,
+    "bias_tee": false,
+    "swap_iq": true,
+    "settle_ms": 250,
+    "buffer_blocks": 16,
+    "block_samples": 32768
+  },
+  "dsp": {
+    "channel_lp_hz": 12000,
+    "channel_taps": 255,
+    "subcarrier_hz": 9960,
+    "sub_lp_hz": 700,
+    "sub_taps": 127,
+    "tone_lp_hz": 100,
+    "tone_taps": 127,
+    "tone_hz": 30,
+    "agc_tau_s": 0.5,
+    "integration_s": 1.0,
+    "hop_s": 1.0,
+    "noise_bins_hz": [
+      25.0,
+      27.0,
+      33.0,
+      35.0
+    ],
+    "_note": "intermediate 32 kHz, demod 4 kHz, output 1 kHz -- see amendment A9"
+  },
+  "bearing": {
+    "phase_sign": 1,
+    "phase_offset_deg": 2.12,
+    "station_cal_deg": 0.0,
+    "smooth_n": 3
+  },
+  "quality": {
+    "weights": {
+      "am": 0.25,
+      "sub": 0.1,
+      "snr": 0.25,
+      "stab": 0.4
+    },
+    "am_nominal_depth": 0.3,
+    "sub_nominal_depth": 0.3,
+    "snr_lo_db": 26.0,
+    "snr_hi_db": 46.0,
+    "stab_full_deg": 10.0,
+    "flag_sub_threshold": 0.15,
+    "flag_am_threshold": 0.35,
+    "flag_stab_threshold": 0.4,
+    "history": 5
+  },
+  "frequency": {
+    "min_mhz": 108.0,
+    "max_mhz": 117.95,
+    "grid_khz": 50,
+    "snap_tolerance_khz": 1,
+    "debounce_ms": 300,
+    "allowlist_mhz": [],
+    "denylist_mhz": []
+  },
+  "record": {
+    "enabled": false,
+    "dir": "/var/lib/rb-vor/iq",
+    "format": "cu8",
+    "max_seconds": 30,
+    "trigger": "on_flag"
+  },
+  "log": {
+    "level": "INFO",
+    "solution_csv": "/var/log/rb-vor/solutions.csv"
+  }
+}

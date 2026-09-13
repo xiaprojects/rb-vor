@@ -1,0 +1,14 @@
+# Runtime
+numpy>=1.26
+scipy>=1.11
+websockets>=12.0
+aiohttp>=3.9
+jsonschema>=4.21
+# SoapySDR is a SYSTEM package, not a wheel:
+#   sudo apt install python3-soapysdr soapysdr-module-rtlsdr rtl-sdr
+# Optional fallback binding:
+#   pip install pyrtlsdr
+
+# Development
+pytest>=8.0
+ruff>=0.5
