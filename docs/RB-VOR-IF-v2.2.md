@@ -29,8 +29,11 @@ Hosts and paths are configurable; the shapes below are not.
 
 ## 2. Consumed — WebSocket
 
-RB-VOR connects as a client and sends no frames except protocol pings. Each
-inbound frame is a UTF-8 JSON object.
+RB-VOR connects as a client and ~~sends no frames except protocol pings~~
+sends no frames at all. RB-01 has no ping/pong and answers no control frame,
+so the link is considered lost only when the socket is: closed by the peer, or
+declared dead by TCP keepalive on RB-VOR's side (CLAUDE.md A29). Each inbound
+frame is a UTF-8 JSON object.
 
 | Field | Type | Unit | Range | Use |
 |---|---|---|---|---|

@@ -18,9 +18,15 @@ Baseband modulating function, CVOR::
 
     beta = deviation / 30 = 480 / 30 = 16      (FM modulation index)
 
-then placed at the tuner offset::
+then placed where a tuner parked at ``nav + f_offset`` puts the navaid, i.e.
+at ``nav - LO = -f_offset`` in baseband (amendment A22)::
 
-    z(t) = level * m(t) * exp(j*2*pi*f_offset*t) + n(t)
+    z(t) = level * m(t) * exp(-j*2*pi*f_offset*t) + n(t)
+
+With the default ``f_offset = -fs/4`` the carrier is at **+fs/4**. Files
+written before A22 placed it at ``+f_offset`` and carry no
+``synthetic.carrier_at`` key in their sidecar; `tools/vor_replay.py` warns
+about them and they decode with ``--swap-iq``.
 
 Radial encoding, and amendment A6
 ---------------------------------
@@ -67,6 +73,9 @@ from rbvor.record import IQMeta, IQWriter  # noqa: E402
 
 TONE_HZ = 30.0
 SUBCARRIER_HZ = 9960.0
+#: Must equal `rbvor.dsp.CARRIER_CONVENTION` (D5). The self-test checks it.
+CARRIER_CONVENTION = "-offset"
+
 IDENT_HZ = 1020.0
 DEVIATION_HZ = 480.0
 CHANNEL_BW_HZ = 12000.0  # SNR is specified in this bandwidth
@@ -212,7 +221,9 @@ def generate_blocks(p: VorParams) -> Iterator[np.ndarray]:
     rng = np.random.default_rng(p.seed)
     phi_am, phi_fm = p.phases()
     beta = p.deviation_hz / p.tone_hz
-    f_off = p.offset_hz + p.drift_hz
+    # A22: the carrier sits at -offset_hz. `drift_hz` is the signal's own
+    # frequency error, positive = higher RF, and adds directly.
+    f_off = -p.offset_hz + p.drift_hz
     total = p.n_samples
     n0 = 0
     while n0 < total:
@@ -301,6 +312,9 @@ def write_file(p: VorParams, path: Path, fmt: str = "cu8",
             "level": p.level,
             "seed": p.seed,
             "snr_bandwidth_hz": CHANNEL_BW_HZ,
+            # A22: which side of centre the carrier was placed on. Absent in
+            # files generated before the convention was corrected.
+            "carrier_at": CARRIER_CONVENTION,
         },
     )
     clipped = 0

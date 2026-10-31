@@ -5,8 +5,9 @@ Every command is meant to be copied as-is. The long version, with expected
 output at every step and the failure table, is `docs/bench-test.md`.
 
 > **Supplemental / non-required equipment. Day VFR only.** Not a certified NAV
-> receiver, not for IFR or approach guidance. `vordir` is meaningless whenever
-> `vorsignal` is 0.
+> receiver, not for IFR or approach guidance. `vorradial` is usable only when
+> `vorstatus >= 4` (4 = degraded, 5 = tracking); every other field is a live
+> measurement whatever the status (RB-VOR-IF v2.2).
 
 ---
 
@@ -124,7 +125,8 @@ Within a few seconds you should see the state walk
 ```
 INFO rbvor.sdr: tuned 109.400 MHz (centre 109.144 MHz, offset -256.0 kHz)
 INFO rbvor: TRACKING: vorsignal 87
-INFO rbvor: dry run: ... last {'vordir': 130, 'vorsignal': 87}
+  [track ] 109.400 MHz  radial 130°  snr 38 dB  am 0.28  sub 0.24
+INFO rbvor: dry run: ... last {'vorradial': 130, 'vorsnr': 38, 'voram': 28, 'vorstatus': 5, 'vorsub': 24, 'vorfreqactive': 109400}
 ```
 
 **No station to test against?** Decode a synthetic signal through the identical
@@ -135,7 +137,7 @@ python3 tools/vor_gen.py --radial 137 --seconds 30 --snr-db 25 -o /tmp/bench
 python3 tools/vor_replay.py /tmp/bench.cu8       # residual should be ~ -1.97
 ```
 
-**`vorsignal` stuck at 0 with `overruns` climbing** in the periodic `sdr` line
+**`sig 0` on the status line with `overruns` climbing** in the periodic `sdr` line
 means the Pi is not keeping up: raise `sdr.block_samples` in the config, or find
 what else is using the core. The bearing is never wrong in this case, only
 absent — a window that spans a sample gap is discarded rather than decoded.
@@ -151,7 +153,8 @@ journalctl -u rb-vor -f
 
 Expect `Active: active (running)`, the same state transitions as step 4, and no
 watchdog restarts. The service reads `vorfreq` from the bridge WebSocket and
-POSTs `{"vordir", "vorsignal"}` to the bridge on every update.
+POSTs `{"vorradial", "vorsnr", "voram", "vorstatus", "vorsub", "vorfreqactive"}`
+to the bridge whenever a field changes (RB-VOR-IF v2.2, `docs/RB-VOR-IF-v2.2.md`).
 
 ---
 
@@ -179,6 +182,90 @@ The residual line is the verdict:
 
 ---
 
+## Picking the right dongle (more than one fitted)
+
+With ADS-B, OGN or a second receiver in the same box, rb-vor must be told which
+RTL-SDR is on the **VOR antenna** — otherwise it opens whichever enumerated
+first, and that order changes between boots. Symptom: a flat noise floor that
+does not change between the ground and 2,500 ft.
+
+```bash
+rtl_test -d 0 ; rtl_test -d 1 ; rtl_test -d 2       # index -> serial, tuner
+```
+
+**Check the tuner, not just the index.** The gain ladder and the spectral sense
+both depend on it: an R820T2 has 29 gain steps to 49.6 dB, an FC0012 has five
+and stops at 19.2 dB. The daemon logs what it found, and snaps the configured
+gain to that tuner's ladder:
+
+```
+INFO rbvor.sdr: SDR open: pyrtlsdr index 0 (serial 00000001), FC0012 tuner
+WARNING rbvor.sdr: FC0012: gain 32.8 dB is above this tuner's maximum; using 19.2 dB (ladder -9.9..19.2 dB)
+```
+
+Give them names once, then pin the VOR one by serial:
+
+```bash
+rtl_eeprom -d <n> -s VOR01                          # replug afterwards
+```
+
+```json
+"sdr": { "device_serial": "VOR01" }
+```
+
+## Per-tuner settings, and "does my dongle need swap_iq?"
+
+The **tuner** decides the gain ladder and may decide the spectral sense, so
+settings that belong to it live in `sdr.tuner_profiles` and are applied when
+that tuner reports itself — one config file, either dongle:
+
+```json
+"sdr": {
+  "gain_db": 19.2,
+  "tuner_profiles": {
+    "FC0012": { "gain_db": 19.2 },
+    "R820T":  { "gain_db": 32.8 }
+  }
+}
+```
+
+Keys: `swap_iq`, `gain_db`, `ppm`. Anything absent falls back to the `sdr`
+block. Names are librtlsdr's (`FC0012`, `R820T`, `R828D`, `E4000`, …); note
+librtlsdr reports an R820T2 as `R820T`.
+
+**The sense is a measurement, not a guess.** Capture 10 s from the dongle in
+question and let it decode both ways:
+
+```bash
+tools/vor_capture.py -f 109.4 -t 10 --device-serial VOR01 --site "ground test"
+tools/vor_replay.py --auto-swap captures/<newest>.cu8
+```
+
+```
+  spectral sense test (A28)
+    normal       AM depth 0.260   30 Hz SNR   38.1 dB
+    swapped      AM depth 0.021   30 Hz SNR   11.6 dB
+    -> NORMAL sense decodes: leave "swap_iq" false for this tuner
+```
+
+If the swapped line wins, put `"swap_iq": true` in **that tuner's profile**,
+not in the `sdr` block — the other dongle does not want it. If both read
+~0 the tool says so and declines to choose: there is no signal to judge, and
+the sense is not your problem.
+
+A serial that is not present is a startup error listing the serials that are —
+deliberately, because the failure it prevents is silent. With `device_serial`
+empty the receiver falls back to `device_index` (default 0) and warns when more
+than one dongle is present. The daemon logs what it actually opened:
+
+```
+INFO rbvor.sdr: SDR open: pyrtlsdr serial 'VOR01' (index 2)
+```
+
+`tools/vor_capture.py` takes the same `--device-serial` / `--device-index` and
+records the device in the sidecar, so a capture and a live decode can never
+disagree about which antenna they heard.
+
 ## 7. RTL-SDR Blog V4
 
 The V4's R828D tuner needs the rtl-sdr-blog fork of `librtlsdr`. On the stock
@@ -194,6 +281,7 @@ vendor's current instructions to install their `librtlsdr`, then re-run step 2.
 |---|---|
 | Prove the software | `python3 -m rbvor --self-test` |
 | Decode live, no bridge | `python3 -m rbvor --config /etc/rb-vor/rb-vor.json --freq 109.4 --dry-run` |
+| Log every decoded window | add `--csv drive.csv` to any run (see "Dumping raw decode data") |
 | Inspect a capture | `python3 tools/vor_spectrum.py captures/<file>.cu8` |
 | Replay a capture | `python3 tools/vor_replay.py captures/<file>.cu8` |
 | Test without hardware | `python3 tools/mock_bridge.py --port 8099 --script "109.4@0" &` then run with that bridge URL |
@@ -209,6 +297,7 @@ vendor's current instructions to install their `librtlsdr`, then re-run step 2.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `usb_claim_interface error -6` | kernel DVB driver holds the dongle | reboot, or `sudo rmmod dvb_usb_rtl28xxu` |
-| `vorsignal` always 0, everything else fine | not calibrated | step 3 |
+| decodes nothing; measurements flat on the ground and in the air | **the receiver is on the wrong dongle** — several fitted, `sdr.device_serial` unset (CLAUDE.md F6) | §"Picking the right dongle" |
+| `vorstatus` never reaches 4, radial 0, measurements healthy | not calibrated | step 3 |
 | tunes but decodes nothing, RTL-SDR Blog V4 | wrong `librtlsdr` | §7 |
-| decodes nothing; `--survey` says **MIRROR DETECTED** | spectrum is flipped | set `"swap_iq": true` in the `sdr` config block |
+| decodes nothing; `--survey` says **MIRROR DETECTED** on a capture from *this* dongle | inverted device or I/Q-swapped capture path (a standard RTL-SDR does not do this — A22) | set `"swap_iq": true` in the `sdr` config block |

@@ -54,12 +54,18 @@ def test_shipped_default_config_loads():
     assert cfg.dsp.sub_lp_hz < 2000                 # amendment A9
 
 
-def test_shipped_default_is_uncalibrated():
-    """Amendment A2: the shipped config must not contain a usable calibration."""
+def test_shipped_config_carries_the_flight_calibration_and_a2_still_holds(tmp_path, base):
+    """Amendment A2 is the *mechanism*: null calibration -> no bearing, ever.
+    Since 1.0.0 the shipped file carries the flight-validated constants
+    (phase_sign +1, phase_offset_deg +2.12); the mechanism is exercised here
+    by nulling them, and the shipped values are pinned so a stray edit shows.
+    """
     cfg = load(DEFAULT)
-    assert not cfg.calibrated
-    assert cfg.bearing.phase_sign is None
-    assert cfg.bearing.phase_offset_deg is None
+    assert cfg.calibrated
+    assert cfg.bearing.phase_sign == 1
+    assert abs(cfg.bearing.phase_offset_deg - 2.12) < 1e-9
+    base["bearing"].update(phase_sign=None, phase_offset_deg=None)
+    assert not load(write(tmp_path, base)).calibrated
 
 
 def test_quality_defaults_match_the_a11_derivation():
@@ -102,7 +108,7 @@ def test_missing_section_is_rejected(tmp_path, base):
     (lambda d: d["sdr"].update(tuner_offset_hz=900_000), "tuner_offset_hz"),
     (lambda d: d["dsp"].update(sub_lp_hz=2500), "sub_lp_hz"),
     (lambda d: d["dsp"].update(integration_s=1.017), "integration_s"),
-    (lambda d: d["dsp"].update(hop_s=2.0), "hop_s"),
+    (lambda d: d["dsp"].update(hop_s=d["dsp"]["integration_s"] + 1.0), "hop_s"),
     (lambda d: d["frequency"].update(max_mhz=107.0), "max_mhz"),
     (lambda d: d["quality"]["weights"].update(am=0.9), "weights"),
     (lambda d: d["quality"].update(snr_hi_db=10.0), "snr_hi_db"),
@@ -133,11 +139,86 @@ def test_a_complete_calibration_is_accepted(tmp_path, base):
     assert cfg.bearing.phase_sign == 1
 
 
-def test_on_change_without_keepalive_is_rejected(tmp_path, base):
-    """Doc A 10.3: a consumer could not distinguish 'steady' from 'dead'."""
-    e = broken(tmp_path, base,
-               lambda d: d["publish"].update(mode="on_change", keepalive_s=0.5))
-    assert "keepalive_s" in str(e)
+def test_device_selection_keys_are_accepted_and_optional(tmp_path, base):
+    """A27. Optional, so a config written before the aircraft had three dongles
+    still loads -- but present in the shipped file so the next builder sees them."""
+    from rbvor.config import load as _load
+    shipped = json.loads(DEFAULT.read_text())["sdr"]
+    assert shipped["device_serial"] == "" and shipped["device_index"] == 0
+
+    base["sdr"].update(device_serial="VOR01", device_index=2)
+    cfg = load(write(tmp_path, base))
+    assert cfg.sdr["device_serial"] == "VOR01" and cfg.sdr["device_index"] == 2
+
+    base["sdr"].pop("device_serial")
+    base["sdr"].pop("device_index")
+    assert _load(write(tmp_path, base)).sdr.get("device_serial", "") == ""
+
+
+def test_shipped_gains_are_steps_of_the_tuners_they_name():
+    """A28. The first version of this test hard-coded the R820T2 ladder and
+    would have passed a value the aircraft's tuner cannot produce: the VOR
+    dongle is an **FC0012** (five steps, max 19.2 dB). Each profile must name a
+    gain its own tuner can actually produce, and the base must be safe on the
+    tuner that is fitted, since that is the fallback."""
+    fc0012 = {-9.9, -4.0, 7.1, 17.9, 19.2}
+    r820t2 = {0.0, 0.9, 1.4, 2.7, 3.7, 7.7, 8.7, 12.5, 14.4, 15.7, 16.6, 19.7,
+              20.7, 22.9, 25.4, 28.0, 29.7, 32.8, 33.8, 36.4, 37.2, 38.6, 40.2,
+              42.1, 43.4, 43.9, 44.5, 48.0, 49.6}
+    sdr = json.loads(DEFAULT.read_text())["sdr"]
+    assert sdr["gain_db"] in fc0012
+    assert sdr["tuner_profiles"]["FC0012"]["gain_db"] in fc0012
+    assert sdr["tuner_profiles"]["R820T"]["gain_db"] in r820t2
+
+
+def test_shipped_profiles_do_not_pre_judge_the_spectral_sense():
+    """O21 is a measurement. `swap_iq` is deliberately absent from the shipped
+    FC0012 profile: guessing it would send the next flight after a fault that
+    may not exist (D8)."""
+    prof = json.loads(DEFAULT.read_text())["sdr"]["tuner_profiles"]
+    assert "swap_iq" not in prof["FC0012"]
+    assert "swap_iq" not in prof["R820T"]
+
+
+def test_a_profile_key_that_is_not_a_tuner_is_rejected(tmp_path, base):
+    base["sdr"]["tuner_profiles"] = {"R820T3": {"gain_db": 30.0}}
+    assert "tuner_profiles" in str(broken(tmp_path, base, lambda d: None))
+
+
+def test_a_profile_cannot_smuggle_in_unrelated_settings(tmp_path, base):
+    """The profile overlays three tuner properties; anything else belongs in
+    the sdr block, where it is validated."""
+    base["sdr"]["tuner_profiles"] = {"FC0012": {"sample_rate_hz": 250000}}
+    assert "tuner_profiles" in str(broken(tmp_path, base, lambda d: None))
+
+
+def test_keepalive_may_be_disabled_as_the_v2_spec_allows(tmp_path, base):
+    """RB-VOR-IF v2.x section 3.4: keepalive_s = 0 sends purely on change; the
+    staleness timeout is the consumer's job (section 4, item 2). The schema
+    used to forbid 0 while the spec permitted it (A20)."""
+    base["publish"]["keepalive_s"] = 0
+    assert load(write(tmp_path, base)).publish["keepalive_s"] == 0
+
+
+def test_shipped_default_carries_no_dead_publish_keys():
+    """A20: mode / period_s / deadband_deg / signal_scale stopped meaning
+    anything with v2.0 and must not be shipped as if they did."""
+    from rbvor.config import DEPRECATED_PUBLISH_KEYS
+    pub = json.loads(DEFAULT.read_text())["publish"]
+    assert not set(DEPRECATED_PUBLISH_KEYS) & set(pub), pub
+
+
+def test_pre_v2_config_with_dead_publish_keys_still_loads(tmp_path, base, caplog):
+    """A config written for v1.0 keeps loading -- with a warning naming the
+    keys -- so an upgrade does not refuse to start over settings that are
+    merely obsolete."""
+    import logging
+    base["publish"].update(mode="periodic", period_s=1.0, deadband_deg=1,
+                           signal_scale="percent")
+    with caplog.at_level(logging.WARNING, logger="rbvor.config"):
+        cfg = load(write(tmp_path, base))
+    assert cfg.publish["bearing_ref"] == "from"
+    assert "signal_scale" in caplog.text and "no longer do anything" in caplog.text
 
 
 def test_allowlist_denylist_overlap_is_rejected(tmp_path, base):
@@ -147,9 +228,9 @@ def test_allowlist_denylist_overlap_is_rejected(tmp_path, base):
     assert "denylist" in str(e)
 
 
-def test_open_items_o3_o4_are_switchable_not_hardcoded(tmp_path, base):
-    """Q1/Q2 are unanswered; both branches must be reachable from config."""
-    base["publish"].update(signal_scale="boolean", bearing_ref="to")
+def test_open_item_o4_is_switchable_not_hardcoded(tmp_path, base):
+    """Q2 (FROM vs TO) is still unanswered; both branches must be reachable
+    from config. Q1 (signal_scale) became moot with v2.0 -- see A20."""
+    base["publish"].update(bearing_ref="to")
     cfg = load(write(tmp_path, base))
-    assert cfg.publish["signal_scale"] == "boolean"
     assert cfg.publish["bearing_ref"] == "to"

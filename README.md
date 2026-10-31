@@ -6,8 +6,9 @@ RB-Avionics bridge.
 
 > **Supplemental / non-required equipment.** Day VFR situational awareness only.
 > Not a certified NAV receiver. Not for IFR navigation or approach guidance.
-> Independent primary navigation is assumed present. `vordir` is meaningless
-> whenever `vorsignal` is 0 — consumers must honour that.
+> Independent primary navigation is assumed present. `vorradial` is usable only
+> when `vorstatus >= 4` — consumers must honour that; every other field is a
+> measurement, published whatever the status.
 
 Part of the RB-Avionics platform · `xiaprojects/rb-vor` · https://www.rbavionics.com
 
@@ -44,16 +45,23 @@ image to a decoded 109.40 MHz bearing.
 | M7 `bridge_client.py` + `publisher.py` + `mock_bridge.py` | done, 468 tests green |
 | M8 packaging, systemd, installer, IF spec | done |
 | M9 recording + cloud schema | done |
-| Interface v2.0 (`vorradial`/`vorsnr`/`voram`, transmit-on-change) | done, 523 tests green (510 + 13 SDR) |
-| M10 field campaign | **in progress — LIRZ orbit confirmed the bearing to 1.4°** |
+| Interface v2.0 (`vorradial`/`vorsnr`/`voram`, transmit-on-change) | done |
+| Interface v2.1 (`vorstatus`/`vorsub`, SDR released when idle) | done |
+| Interface v2.2 (`vorfreqactive`, status 4/5 split, payload never zeroed, `--csv`) | done — 1.0.0 |
+| A22 offset-convention fix, F3/F5 daemon-liveness fixes, D6 hot-path 3.5× | done |
+| A25 signal chain (filters, 2 s windows, AFC), D7 harmonic estimator (opt-in) | done, 550 tests green — bearing RMS halved, 4× at low SNR with D7 |
+| M10 field campaign | **in progress** — an orbit was flown (see `CLAUDE.md`, "Field campaign"); the GPS-referenced evidence is not yet in the tree (O14) |
 
-Everything except the field campaign is implemented. The interface is frozen at
-RB-VOR-IF v1.0. See [`CHANGELOG.md`](CHANGELOG.md) for measured performance and
-known limitations.
+Everything except the field campaign is implemented. The interface is
+**RB-VOR-IF v2.2** ([`docs/RB-VOR-IF-v2.2.md`](docs/RB-VOR-IF-v2.2.md)); v1.0,
+v2.0 and v2.1 are retained for reference. See [`CHANGELOG.md`](CHANGELOG.md) for
+measured performance and known limitations.
 
-> **A fresh install publishes no bearing at all**, only `vorsignal: 0`, until the
-> calibration is measured. That is deliberate — an uncalibrated bearing looks
-> plausible and is wrong, which is the worst failure this system has.
+> **An uncalibrated config publishes no bearing** — `vorradial` stays 0 and
+> `vorstatus` never reaches 4, while the signal measurements are published
+> normally. That is deliberate — an uncalibrated bearing looks plausible and is
+> wrong, which is the worst failure this system has. The shipped config carries
+> the flight-validated calibration (1.0.0).
 
 ---
 
@@ -129,35 +137,43 @@ All comparisons are in integer kHz. Never compare navaid frequencies as floats.
 
 ---
 
-## Interface — RB-VOR-IF v1.0
+## Interface — RB-VOR-IF v2.2
 
 Consumes, over `ws://localhost/bridge`:
 
 | Field | Unit | Use |
 |---|---|---|
 | `vorfreq` | MHz | tuning command |
-| `gpsTrack` | ° true | diagnostics/log only in v1.0 |
+| `gpsTrack` | ° true | diagnostics/log only |
 
-Produces, `POST http://localhost/bridgeUpdate`, 1 Hz:
+Produces, `POST http://localhost/bridgeUpdate`, whenever a field changes (plus
+an optional keep-alive, `publish.keepalive_s`):
 
 ```json
-{ "vordir": 130, "vorsignal": 0 }
+{ "vorradial": 130, "vorsnr": 42, "voram": 28, "vorstatus": 5, "vorsub": 29, "vorfreqactive": 109400 }
 ```
 
 | Field | Unit | Range | Meaning |
 |---|---|---|---|
-| `vordir` | ° magnetic | 0–359 | radial **FROM** the station |
-| `vorsignal` | — | 0–100 | 0 = NAV flag, `vordir` invalid |
+| `vorradial` | ° magnetic | 0–359 | radial **FROM** the station; **usable only when `vorstatus >= 4`** |
+| `vorsnr` | dB | 0–120 | 30 Hz tone SNR, last measurement |
+| `voram` | — | 0–100 | 30 Hz AM depth ×100, last measurement |
+| `vorstatus` | — | 0–5 | 0 idle, 1 no signal, 2 tuning, 3 acquiring, 4 degraded, 5 tracking |
+| `vorsub` | — | 0–100 | 9960 Hz subcarrier level ×100 |
+| `vorfreqactive` | kHz | 0 / 108000–118000 | tuned channel (109400 = 109.400 MHz); 0 = none |
 
-Full spec: `docs/rb-vor-architecture.md` §10. Additive fields only within v1.x.
+No field is zeroed for validity (1.0.0): a field is 0 only when nothing has been
+measured since the last retune. Full spec:
+[`docs/RB-VOR-IF-v2.2.md`](docs/RB-VOR-IF-v2.2.md) (supersedes doc A §10).
+Additive fields only within v2.x.
 
 ---
 
 ## Layout
 
 ```
-rbvor/        package — freqrules and record implemented, rest stubbed by milestone
-tools/        vor_capture (M5, ready) · vor_gen, vor_replay, vor_sweep, vor_calibrate (M2–M4)
+rbvor/        package — full chain: sdr → dsp → bearing/quality → controller → publisher
+tools/        vor_capture · vor_gen · vor_replay (--survey) · vor_spectrum · vor_sweep · vor_calibrate · mock_bridge · collect_report
 tests/        file-driven only; CI has no SDR hardware
 docs/         architecture (doc A), implementation plan, open items, first-light log
 config/       default rb-vor.json

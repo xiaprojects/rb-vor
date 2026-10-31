@@ -384,6 +384,7 @@ def test_uncalibrated_daemon_never_publishes_a_bearing():
     raw = copy.deepcopy(BASE)
     raw["sdr"]["sample_rate_hz"] = FS
     raw["sdr"]["tuner_offset_hz"] = -FS // 4
+    raw["bearing"].update(phase_sign=None, phase_offset_deg=None)   # A2 case, explicit
     cfg = Config(raw=raw)
     assert not cfg.calibrated
     c = Controller(cfg, FakeSdr(), Publisher(cfg.publish, t, clock=clock),
@@ -424,3 +425,174 @@ def test_controller_ignores_its_own_echo():
     c = BridgeClient(BASE["bridge"], on_channel=seen.append)
     c.handle_text('{"vorfreq":109.4,"vordir":250,"vorsignal":99}')
     assert seen == [109.4]
+
+
+# --------------------------------------------------------------------------- #
+# the live socket -- RB-01 answers no control frames (CLAUDE.md A29)
+# --------------------------------------------------------------------------- #
+
+class Rb01Standin:
+    """A WebSocket server that behaves like RB-01: it completes the handshake and
+    streams `vorfreq` frames, and never reads from the socket again -- so it
+    answers no ping and no close frame. A `websockets` server cannot stand in
+    for it, because the library always answers both.
+    """
+
+    GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(self, period_s=0.05):
+        self.period_s = period_s
+        self.connections = 0
+        self._writers = []
+
+    async def __aenter__(self):
+        import asyncio
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        self.url = f"ws://127.0.0.1:{self._server.sockets[0].getsockname()[1]}/"
+        return self
+
+    async def __aexit__(self, *exc):
+        for w in self._writers:
+            w.close()
+        self._server.close()
+        await self._server.wait_closed()
+
+    async def _handle(self, reader, writer):
+        import asyncio
+        import base64
+        import hashlib
+        request = await reader.readuntil(b"\r\n\r\n")
+        key = next(line.split(b":", 1)[1].strip()
+                   for line in request.split(b"\r\n")
+                   if line.lower().startswith(b"sec-websocket-key:"))
+        accept = base64.b64encode(hashlib.sha1(key + self.GUID).digest())
+        writer.write(b"HTTP/1.1 101 Switching Protocols\r\n"
+                     b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                     b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+        self.connections += 1
+        self._writers.append(writer)
+        payload = b'{"vorfreq":109.4}'
+        try:
+            while True:            # write-only from here on, like RB-01
+                writer.write(bytes([0x81, len(payload)]) + payload)
+                await writer.drain()
+                await asyncio.sleep(self.period_s)
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+
+
+def _compressed_library_keepalive(monkeypatch):
+    """`websockets` pings every 20 s, gives up 20 s later without a pong, then
+    waits 10 s for a close frame. Run those defaults 100x faster so a test can
+    see them; anything the client passes explicitly goes through untouched."""
+    import websockets
+    real = websockets.connect
+
+    def connect(uri, **kw):
+        kw.setdefault("ping_interval", 0.2)
+        kw.setdefault("ping_timeout", 0.2)
+        kw.setdefault("close_timeout", 0.1)
+        return real(uri, **kw)
+
+    monkeypatch.setattr(websockets, "connect", connect)
+
+
+def _run_client(url, seconds):
+    """Run a BridgeClient for `seconds`, then stop it the way `__main__` does
+    (cancel the task). Returns what it saw and how long the stop took."""
+    import asyncio
+    import time
+
+    channels, drops = [], []
+    c = BridgeClient(dict(BASE["bridge"], ws_url=url), on_channel=channels.append,
+                     on_disconnect=lambda: drops.append(len(channels)))
+
+    async def scenario():
+        task = asyncio.create_task(c.run())
+        await asyncio.sleep(seconds)
+        connected = c.connected
+        task.cancel()
+        t0 = time.monotonic()
+        await asyncio.gather(task, return_exceptions=True)
+        return connected, time.monotonic() - t0
+
+    return channels, drops, scenario
+
+
+def test_link_to_a_bridge_that_never_answers_pings_stays_up(monkeypatch):
+    """The field log: `sent 1011 (internal error) keepalive ping timeout; no
+    close frame received`, every ~50 s. RB-01 has no ping/pong, so the library
+    keepalive dropped a healthy link -- and stopped delivering `vorfreq` for
+    the 10 s it spent waiting for a close frame first."""
+    import asyncio
+    _compressed_library_keepalive(monkeypatch)
+
+    async def go():
+        async with Rb01Standin() as bridge:
+            channels, drops, scenario = _run_client(bridge.url, 1.5)
+            connected, _ = await scenario()
+            return bridge.connections, channels, drops, connected
+
+    connections, channels, drops, connected = asyncio.run(go())
+    assert connected and connections == 1, "the link was dropped and re-made"
+    assert drops == [len(channels)], "disconnected before being stopped"
+    # 1.5 s at 20 frames/s; a link stalled waiting for a pong delivers ~4
+    assert len(channels) >= 15 and set(channels) == {109.4}
+
+
+def test_stop_does_not_wait_for_a_close_frame_rb01_never_sends():
+    """Every shutdown waited the library's 10 s close timeout."""
+    import asyncio
+
+    async def go():
+        async with Rb01Standin() as bridge:
+            channels, _, scenario = _run_client(bridge.url, 0.3)
+            connected, stop_s = await scenario()
+            return channels, connected, stop_s
+
+    channels, connected, stop_s = asyncio.run(go())
+    assert connected and channels
+    assert stop_s < 3.0, f"stop took {stop_s:.1f} s"
+
+
+def test_the_bridge_socket_has_tcp_keepalive(monkeypatch):
+    """With the WebSocket ping gone, kernel keepalive is the only thing that
+    notices a bridge host vanishing without closing (power cut, WiFi drop). A
+    pure reader on such a socket would otherwise wait forever."""
+    import asyncio
+    import socket
+
+    from rbvor import bridge_client
+
+    seen = []
+    real = bridge_client.enable_tcp_keepalive
+
+    def spy(sock):
+        ok = real(sock)
+        seen.append((ok, sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)))
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            seen.append(sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE))
+        return ok
+
+    monkeypatch.setattr(bridge_client, "enable_tcp_keepalive", spy)
+
+    async def go():
+        async with Rb01Standin() as bridge:
+            _, _, scenario = _run_client(bridge.url, 0.3)
+            await scenario()
+
+    asyncio.run(go())
+    assert seen and seen[0] == (True, 1)
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        assert seen[1] == bridge_client.KEEPALIVE_IDLE_S
+
+
+def test_keepalive_helper_never_raises():
+    from rbvor.bridge_client import enable_tcp_keepalive
+
+    class Refuses:
+        def setsockopt(self, *a):
+            raise OSError("not a TCP socket")
+
+    assert enable_tcp_keepalive(None) is False
+    assert enable_tcp_keepalive(Refuses()) is False

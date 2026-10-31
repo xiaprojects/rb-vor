@@ -11,21 +11,29 @@ Split deliberately in two:
 * `Publisher` -- glues the policy to a transport. The transport is injectable,
   so T5/T6 run without a network.
 
-Two rules from doc A section 10.4 that shape the design:
+Wire format: RB-VOR-IF v2.2 (`docs/RB-VOR-IF-v2.2.md`), six integer fields --
+`vorradial`, `vorsnr`, `voram`, `vorstatus`, `vorsub`, `vorfreqactive`. The
+v1.0 pair `vordir`/`vorsignal` is gone from the wire (CLAUDE.md A20);
+`vorsignal` lives on internally as the validity gate and in the solution log.
+Since A26 (the 1.0.0 lineage's "payload is never zeroed") no field is gated by
+validity: `vorstatus` (>= 4 usable) is the one thing a consumer reads for that.
 
-* **Drop, never queue.** A late bearing is worse than no bearing: it describes
-  where the aircraft was, presented as where it is. On failure the publisher
-  retries once immediately and then backs off, discarding anything stale in the
-  meantime. There is no unbounded queue anywhere in this module.
-* **`on_change` without a keep-alive is forbidden.** A consumer could not
-  distinguish a steady bearing from a dead daemon. `config.py` rejects such a
-  configuration outright; this module assumes it cannot happen.
+Two rules that shape the design:
 
-Open items O3 and O4 (Q1 and Q2) are unanswered, so both branches exist and are
-selected by configuration: `publish.signal_scale` is `percent` or `boolean`, and
-`publish.bearing_ref` is `from` or `to`. The internal metric stays 0-100
-regardless of how it is published -- degrading the measurement to match a wire
-format would lose information that the logs and RB-Cloud still need.
+* **Drop, never queue** (doc A section 10.4). A late bearing is worse than no
+  bearing: it describes where the aircraft was, presented as where it is. On
+  failure the publisher retries once immediately and then backs off, discarding
+  anything stale in the meantime. There is no unbounded queue anywhere in this
+  module.
+* **Transmit on change, plus an optional keep-alive** (IF v2.x section 3.4).
+  A POST goes out only when a field changes; `publish.keepalive_s` re-sends an
+  unchanged payload so a consumer can tell "steady" from "dead", and 0 disables
+  it -- the spec then places the staleness timeout on the consumer (section 4,
+  item 2). Doc A's periodic / on_change choice no longer exists.
+
+Open item O4 (Q2) is unanswered, so both branches exist and are selected by
+configuration: `publish.bearing_ref` is `from` or `to`. Q1 (`signal_scale`)
+became moot with v2.0.
 """
 
 from __future__ import annotations
@@ -78,7 +86,7 @@ class PublishPolicy:
     def _shape(self, vordir: int | None, snr_db: float, am_depth: float,
                valid: bool, status: int = 0, sub_level: float = 0.0,
                freq_khz: int = 0) -> dict[str, int]:
-        """Build the v2.3 payload: six integer fields.
+        """Build the v2.2 payload: six integer fields.
 
         vorradial : radial in degrees (0-359).
         vorsnr    : 30 Hz tone SNR in whole dB.
@@ -89,13 +97,14 @@ class PublishPolicy:
         vorfreqactive : currently tuned VOR channel in kHz (109400 = 109.400 MHz);
                     0 when no channel is selected or the frequency was rejected.
 
-        AMENDMENT A20 -- no field is gated by validity any more. Every field
-        carries the last measurement the receiver actually made, and
-        `vorstatus` is the single field that says whether the bearing may be
-        used. Zeroing the trio on the producer side destroyed information the
-        consumer needs (a NO_SIGNAL payload could not be distinguished from an
-        idle one without reading `vorstatus` anyway) and gave a second, weaker
-        validity channel that consumers were free to disagree with.
+        A26 (the 1.0.0 lineage's "A20") -- no field is gated by validity any
+        more. Every field carries the last measurement the receiver actually
+        made, and `vorstatus` is the single field that says whether the bearing
+        may be used. Zeroing the trio on the producer side destroyed
+        information the consumer needs (a NO_SIGNAL payload could not be
+        distinguished from an idle one without reading `vorstatus` anyway) and
+        gave a second, weaker validity channel that consumers were free to
+        disagree with.
 
         A field reads 0 now only when there is genuinely nothing to report --
         no observation yet, or none since the last retune. `valid` is still
@@ -187,7 +196,7 @@ class RecordingTransport:
                      4: "degrad", 5: "track"}
             stn = names.get(st, str(st))
             fq = f"{fk/1000:.3f}" if fk else "  ---  "
-            # A20: every field is always populated, so the line always shows
+            # A26: every field is always populated, so the line always shows
             # the measurements. `vorstatus` is what says whether the radial is
             # usable -- flagged with a trailing '?' so the bench operator reads
             # the same gate the consumer applies.

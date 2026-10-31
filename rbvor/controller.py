@@ -238,6 +238,9 @@ class Controller:
             deviation_hz=o.amp_b if o else 0.0,
             carrier=o.carrier if o else 0.0,
             snr_db=o.snr_db if o else 0.0,
+            carrier_offset_hz=getattr(o, "carrier_offset_hz", 0.0) if o else 0.0,
+            sub_offset_hz=getattr(o, "sub_offset_hz", 0.0) if o else 0.0,
+            sub_coh=getattr(o, "sub_coh", 0.0) if o else 0.0,
             gps_track=self._gps_track,
             overrun=o.overrun if o else False,
             iq_ref=self._last_iq_ref,
@@ -479,6 +482,8 @@ class Controller:
         self._enter(State.TUNING, f"tuning {channel_khz / 1000:.3f} MHz")
         self._flush()
         self.channel_khz = channel_khz
+        if self.recorder is not None:
+            self.recorder.set_channel(channel_khz * 1000)   # so a flag capture names its channel
         self._publish(None, 0, f"retune to {channel_khz / 1000:.3f} MHz")
         self.sdr.set_frequency(channel_khz * 1000)
         self._settle_at = self.clock() + self.cfg.sdr["settle_ms"] / 1000.0

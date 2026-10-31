@@ -3,8 +3,9 @@
 Reference: rb-vor-architecture.md section 10.1; failure mode F8; implementation
 plan M7.
 
-RB-VOR is a read-only client here. It sends no frames except protocol pings, and
-it takes exactly two fields from the bridge state:
+RB-VOR is a read-only client here. It sends no frames at all -- not even
+protocol pings, which RB-01 does not answer (CLAUDE.md A29) -- and it takes
+exactly two fields from the bridge state:
 
 ===========  ==========  ==================================================
 field        unit        use
@@ -13,13 +14,23 @@ field        unit        use
 `gpsTrack`   deg true    **diagnostics and logging only** in v1.0
 ===========  ==========  ==================================================
 
-`vordir` and `vorsignal` appearing in an inbound frame are echoes of our own
-output and are ignored. Everything else is ignored too, silently: the bridge
-carries traffic for the whole platform and will grow fields that are none of our
-business.
+`vorradial`, `vorsnr`, `voram`, `vorstatus` and `vorsub` appearing in an
+inbound frame are echoes of our own output and are ignored. Everything else is
+ignored too, silently: the bridge carries traffic for the whole platform and
+will grow fields that are none of our business.
 
 The parse is pure and separately testable. The async loop around it is thin on
 purpose -- it does reconnection and nothing else.
+
+The link is lost only when the socket is. RB-01 has no ping/pong and does not
+echo anything, close frames included, so the `websockets` keepalive (ping every
+20 s, drop when no pong comes back) tore down a healthy connection every ~50 s
+with `1011 keepalive ping timeout`, and every shutdown waited 10 s for a
+closing handshake that never comes. Both are off. What still notices a bridge
+host that vanished without closing -- power cut, WiFi drop -- is kernel TCP
+keepalive: the peer's kernel answers those probes, not RB-01, so they ask
+nothing of the protocol. Without it a pure reader on a dead socket waits
+forever, and is still waiting after the bridge comes back.
 
 A note on `gpsTrack`. It is tempting to use it (antenna-pattern compensation,
 plausibility checks against a station database). It is not used in v1.0 and a
@@ -34,16 +45,28 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-__all__ = ["ParsedFrame", "parse_frame", "BridgeClient"]
+__all__ = ["ParsedFrame", "parse_frame", "BridgeClient", "enable_tcp_keepalive"]
 
 log = logging.getLogger("rbvor.bridge")
 
 #: Fields we consume. Everything else in the bridge state is not our business.
 CONSUMED = ("vorfreq", "gpsTrack")
+
+#: How long a close waits for the peer's close frame. RB-01 never sends one, so
+#: this is pure delay on every stop: the library default is 10 s, and the legacy
+#: client (websockets < 14) spends up to three of them.
+CLOSE_TIMEOUT_S = 0.5
+
+#: Kernel TCP keepalive: a vanished peer is declared dead after
+#: idle + interval * count = 25 s of silence, then `ws_grace_s` applies.
+KEEPALIVE_IDLE_S = 10
+KEEPALIVE_INTERVAL_S = 5
+KEEPALIVE_COUNT = 3
 
 
 @dataclass(frozen=True)
@@ -104,6 +127,31 @@ def parse_frame(text: str | bytes) -> ParsedFrame:
     return ParsedFrame(vorfreq=freq, gps_track=track, raw_keys=tuple(data))
 
 
+def enable_tcp_keepalive(sock) -> bool:
+    """Turn on kernel keepalive probes. Never raises.
+
+    Returns False when there is no socket or the kernel refuses; the link still
+    works, it just cannot notice a peer that vanished without closing.
+    Per-socket timing knobs are Linux names; elsewhere the system defaults
+    apply, which are slower (typically two hours) but still finite.
+    """
+    if sock is None:
+        return False
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (("TCP_KEEPIDLE", KEEPALIVE_IDLE_S),
+                            ("TCP_KEEPINTVL", KEEPALIVE_INTERVAL_S),
+                            ("TCP_KEEPCNT", KEEPALIVE_COUNT)):
+            opt = getattr(socket, name, None)
+            if opt is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+    except OSError as e:
+        log.warning("bridge socket: TCP keepalive not enabled (%s); a silently "
+                    "vanished bridge will not be noticed", e)
+        return False
+    return True
+
+
 class BridgeClient:
     """Async WebSocket client with exponential backoff.
 
@@ -148,7 +196,10 @@ class BridgeClient:
         backoff = self.cfg["ws_reconnect_min_s"]
         while not self._stop.is_set():
             try:
-                async with websockets.connect(self.cfg["ws_url"]) as ws:
+                async with websockets.connect(self.cfg["ws_url"],
+                                              ping_interval=None,
+                                              close_timeout=CLOSE_TIMEOUT_S) as ws:
+                    enable_tcp_keepalive(ws.transport.get_extra_info("socket"))
                     self.connected = True
                     backoff = self.cfg["ws_reconnect_min_s"]
                     if self.on_connect:

@@ -1,13 +1,18 @@
-"""Signal quality: the `vorsignal` figure published by RB-VOR-IF v1.0.
+"""Signal quality: the internal `vorsignal` figure and the NAV flag.
 
-Reference: rb-vor-architecture.md section 9; amendments A7, A8; open item O10.
-Implementation plan M4.
+Reference: rb-vor-architecture.md section 9; amendments A7, A8, A11 (which
+closed open item O10). Implementation plan M4.
 
 `vorsignal` exists for one reason: failure mode F1, a wrong bearing published as
 a valid one. Every design choice here is biased towards being pessimistic, since
 an over-optimistic quality figure is the mechanism by which F1 reaches the pilot.
 
-Scale (published semantics, doc A section 9)::
+Since RB-VOR-IF v2.0 (CLAUDE.md A20) the 0-100 score is no longer on the wire;
+the bridge receives the measured `vorsnr` / `voram` / `vorsub` instead. The
+score still decides validity (0 = NAV flag, the bearing trio goes to zero), the
+TRACKING / DEGRADED split (A13) and the solution log.
+
+Scale (internal semantics, doc A section 9)::
 
     0        NAV flag -- `vordir` is invalid and must be ignored
     1-39     degraded -- situational awareness only
@@ -23,8 +28,9 @@ Four terms
 
 Amendment A8 established that the first three are correlated, not independent:
 an envelope detector's DC output rises with noise, so measured depth falls as
-SNR falls even at constant transmitted depth. The weights are therefore an open
-item (O10) to be settled from the `tools/vor_sweep.py` curve, not asserted.
+SNR falls even at constant transmitted depth. The weights, the SNR mapping and
+the per-term flag thresholds were therefore re-derived from the
+`tools/vor_sweep.py` curve rather than asserted (A11, `docs/sweep.md`).
 Every term is reported individually as well as combined -- a single scalar is
 useless for diagnosing an installation.
 """

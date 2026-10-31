@@ -26,6 +26,12 @@ from rbvor import IF_VERSION, __version__
 
 FS = 256_000
 RADIAL = 137.0
+#: Constants `tools/vor_calibrate.py` derives for the synthetic generator, per
+#: estimator (docs/calibration.md). The synthetic stages below are judged
+#: against these, never against the config's constant: a flight calibration
+#: includes the station and installation offset (T8), which the generator
+#: does not have. The difference is reported, not failed.
+SYNTHETIC_CAL = {"discriminator": -1.9663, "harmonic": -0.6077}
 
 PASS, FAIL, WARN = "PASS", "FAIL", "WARN"
 
@@ -46,15 +52,30 @@ class _Report:
 
 
 def run_self_test(config_path: Path | None = None) -> int:
+    from rbvor import dsp as dsp_mod
     from rbvor.bearing import BearingCal, BearingTracker, angular_difference
     from rbvor.dsp import DspParams, VorDemod
     from rbvor.freqrules import classify, is_vor_frequency
     from rbvor.publisher import PublishPolicy
     from rbvor.quality import QualityEstimator, QualityParams
+    from tools import vor_gen as gen_mod
     from tools.vor_gen import VorParams, generate_blocks
 
     print(f"\nRB-VOR {__version__} self test  ({IF_VERSION})\n")
     r = _Report()
+
+    # 0 -- is this one tree, or two? A file-by-file deployment (the sftp
+    # upload-on-save workflow) can leave the generator and the demodulator
+    # from different versions. They must agree on where the carrier sits
+    # (D5); if they do not, every synthetic stage below fails for a reason
+    # that has nothing to do with the software being tested.
+    gen_conv = getattr(gen_mod, "CARRIER_CONVENTION", "<pre-D5>")
+    dsp_conv = getattr(dsp_mod, "CARRIER_CONVENTION", "<pre-D5>")
+    r.add("generator and demodulator agree (D5)",
+          PASS if gen_conv == dsp_conv else FAIL,
+          f"vor_gen {gen_conv}, dsp {dsp_conv}" if gen_conv == dsp_conv else
+          f"vor_gen {gen_conv} vs dsp {dsp_conv} -- MIXED VERSIONS on disk: "
+          "sync the whole tree, not single files")
 
     # 1 -- channel rules
     ok_vor = is_vor_frequency(109.4)[0]
@@ -73,8 +94,8 @@ def run_self_test(config_path: Path | None = None) -> int:
     # from the source tree is exactly the case where it is absent. A genuinely
     # malformed config that the schema rejects is still a FAIL -- that is a real
     # defect a builder must fix before the bench.
-    cal = BearingCal(phase_sign=1, phase_offset_deg=-1.9657)
     cfg = None
+    estimator = "discriminator"          # D7: the config may select "harmonic"
     try:
         from rbvor.config import ConfigError, load
         try:
@@ -85,15 +106,26 @@ def run_self_test(config_path: Path | None = None) -> int:
                 r.add("configuration", WARN,
                       "no config found -- testing with built-in defaults "
                       "(normal from a source tree; it lives in /etc after install)")
+            elif "Additional properties are not allowed" in msg:
+                r.add("configuration loads and validates", FAIL,
+                      msg[:60] + " -- the config is newer than schema/"
+                      "rb-vor.schema.json: MIXED VERSIONS on disk, sync the whole tree")
             else:
                 r.add("configuration loads and validates", FAIL, msg[:80])
         if cfg is not None:
             r.add("configuration loads and validates", PASS, str(cfg.source))
+            estimator = cfg.dsp.fm_estimator
             if cfg.calibrated:
-                cal = cfg.bearing
+                station = cfg.bearing.phase_offset_deg - SYNTHETIC_CAL[estimator]
                 r.add("bearing calibration present", PASS,
-                      f"sign {cal.phase_sign:+d}, "
-                      f"offset {cal.phase_offset_deg:+.4f} deg")
+                      f"sign {cfg.bearing.phase_sign:+d}, "
+                      f"offset {cfg.bearing.phase_offset_deg:+.4f} deg "
+                      f"(fm_estimator {estimator}; {station:+.2f} deg beyond "
+                      f"the synthetic constant = station/installation offset)")
+                if cfg.bearing.phase_sign != 1:
+                    r.add("calibration sign", WARN,
+                          "phase_sign is -1: the synthetic chain calibrates to +1, "
+                          "so a real station confirmed the opposite -- see O1")
             else:
                 r.add("bearing calibration present", WARN,
                       "not set -- the daemon will publish only flags (A2). "
@@ -110,7 +142,7 @@ def run_self_test(config_path: Path | None = None) -> int:
     r.add("synthetic signal generated", PASS,
           f"{RADIAL:.0f} deg radial, 25 dB SNR, {gen_s:.2f} s")
 
-    d = VorDemod(DspParams(fs=FS, offset_hz=-FS // 4))
+    d = VorDemod(DspParams(fs=FS, offset_hz=-FS // 4, fm_estimator=estimator))
     t0 = time.perf_counter()
     obs = []
     for b in blocks:
@@ -129,7 +161,8 @@ def run_self_test(config_path: Path | None = None) -> int:
     r.add("FM deviation", PASS if 400 < o.amp_b < 560 else FAIL,
           f"{o.amp_b:.0f} Hz (nominal 480)")
 
-    # 4 -- bearing
+    # 4 -- bearing, against the synthetic constant for this estimator
+    cal = BearingCal(phase_sign=1, phase_offset_deg=SYNTHETIC_CAL[estimator])
     tr = BearingTracker(cal, history=5)
     q = QualityEstimator(cfg.quality if cfg else QualityParams())
     errs, vals = [], []
@@ -150,28 +183,28 @@ def run_self_test(config_path: Path | None = None) -> int:
         r.add("bearing accuracy", FAIL, "no unflagged solution produced")
 
     # 5 -- flag behaviour on a dead signal
-    d2 = VorDemod(DspParams(fs=FS, offset_hz=-FS // 4))
+    d2 = VorDemod(DspParams(fs=FS, offset_hz=-FS // 4, fm_estimator=estimator))
     q2 = QualityEstimator(cfg.quality if cfg else QualityParams())
     tr2 = BearingTracker(cal, history=5)
     noise = (np.random.default_rng(0).normal(size=FS * 4)
              + 1j * np.random.default_rng(1).normal(size=FS * 4)).astype(np.complex64)
     flagged = []
     for x in d2.push(noise):
-        flagged.append(q2.update(x, tr2.update(x.delta_phi)).flagged)
+        tr2.update(x.delta_phi)
+        flagged.append(q2.update(x, tr2.raw).flagged)      # raw, per A15
     r.add("NAV flag raised on noise only",
           PASS if flagged and all(flagged) else FAIL,
           f"{sum(flagged)}/{len(flagged)} windows flagged")
 
     # 6 -- publish payload shape
     pol = PublishPolicy(cfg.publish if cfg else
-                        {"mode": "periodic", "period_s": 1.0, "deadband_deg": 1,
-                         "keepalive_s": 5.0, "hold_s": 3.0,
-                         "signal_scale": "percent", "bearing_ref": "from"})
+                        {"keepalive_s": 5.0, "hold_s": 3.0, "bearing_ref": "from"})
     payload = pol.decide(137, 53.0, 0.30, state="TRACKING", valid=True,
-                         status=5, sub_level=0.29, freq_khz=109400).payload
+                         status=5, sub_level=0.29, freq_khz=109_400).payload
     shape_ok = (set(payload) == {"vorradial", "vorsnr", "voram",
                                  "vorstatus", "vorsub", "vorfreqactive"}
-                and all(isinstance(v, int) for v in payload.values()))
+                and all(isinstance(v, int) for v in payload.values())
+                and payload["vorstatus"] == 5 and payload["vorfreqactive"] == 109_400)
     r.add(f"publish payload conforms to {IF_VERSION}",
           PASS if shape_ok else FAIL, str(payload))
 

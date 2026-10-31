@@ -136,15 +136,83 @@ def test_integration_window_must_be_whole_cycles():
 
 
 def test_quarter_rate_downmix_matches_the_general_form():
-    """Amendment A1: at -fs/4 the mix is +/-1, +/-j. It must be equivalent."""
+    """Amendment A1: at -fs/4 the mix is +/-1, +/-j. It must be equivalent.
+
+    A22: the carrier sits at -offset = +fs/4, so the mix that brings it to DC
+    is exp(-j*2*pi*(fs/4)*t).
+    """
     x = (np.random.default_rng(3).normal(size=8192)
          + 1j * np.random.default_rng(4).normal(size=8192)).astype(np.complex64)
     fast = VorDemod(params())._downmix(x)
     slow = VorDemod(DspParams(fs=FS, offset_hz=OFFSET + 1))._downmix(x)
     assert not np.allclose(fast, slow)                    # different offsets
     k = np.arange(x.size)
-    want = x * np.exp(2j * np.pi * (FS // 4) * k / FS)
+    want = x * np.exp(-2j * np.pi * (FS // 4) * k / FS)
     assert np.allclose(fast, want, atol=1e-5)
+
+
+def _am_carrier_at(baseband_hz: float, depth: float, seconds: float) -> np.ndarray:
+    """A bare AM carrier at a chosen baseband frequency, built WITHOUT vor_gen.
+
+    Amendment A22 was possible because the generator and the demodulator shared
+    one sign convention and validated each other. This helper is deliberately
+    independent of `tools/vor_gen.py` so the tests below pin the physical
+    convention on their own.
+
+    White noise at roughly 30 dB channel SNR is added on purpose: the depth
+    measurement `(env - carrier) / carrier` is scale-invariant, so a noiseless
+    carrier 100 dB down in the channel filter's stopband still reads a perfect
+    0.30. Only against a noise floor does "on the wrong side" mean "not found",
+    which is also how a real capture behaves.
+    """
+    n = int(seconds * FS)
+    t = np.arange(n) / FS
+    m = 1.0 + depth * np.cos(2 * np.pi * 30.0 * t)
+    z = 0.5 * m * np.exp(2j * np.pi * baseband_hz * t)
+    rng = np.random.default_rng(22)
+    z = z + 0.05 * (rng.normal(size=n) + 1j * rng.normal(size=n))
+    return z.astype(np.complex64)
+
+
+def test_carrier_where_real_hardware_puts_it_decodes():
+    """A22: a tuner parked at nav + offset delivers the navaid at -offset.
+
+    With offset = -fs/4 the carrier is at +fs/4 in the I + jQ baseband, and the
+    demodulator configured with that offset must recover the 30 Hz AM from it.
+    Every real capture in the tree has the signal here.
+    """
+    d = VorDemod(params())
+    obs = []
+    for blk in np.array_split(_am_carrier_at(-OFFSET, 0.30, 4.0), 8):
+        obs += d.push(blk)
+    assert len(obs) >= 2
+    assert abs(obs[-1].amp_a - 0.30) < 0.03, obs[-1].amp_a
+
+
+def test_carrier_on_the_mirror_side_does_not_decode():
+    """The counterpart: a signal at +offset (where the pre-A22 generator put
+    it) must NOT be found, or the previous test would pass vacuously."""
+    right = VorDemod(params())
+    wrong = VorDemod(params())
+    ok, bad = [], []
+    for blk in np.array_split(_am_carrier_at(-OFFSET, 0.30, 4.0), 8):
+        ok += right.push(blk)
+    for blk in np.array_split(_am_carrier_at(OFFSET, 0.30, 4.0), 8):
+        bad += wrong.push(blk)
+    assert bad[-1].carrier < 0.05 * ok[-1].carrier, (bad[-1].carrier, ok[-1].carrier)
+    assert bad[-1].snr_db < ok[-1].snr_db - 20, (bad[-1].snr_db, ok[-1].snr_db)
+    assert abs(bad[-1].amp_a - 0.30) > 0.1, bad[-1].amp_a
+
+
+def test_swap_iq_moves_a_mirrored_carrier_back():
+    """Conjugation is the documented override for a genuinely inverted
+    device: a mirrored signal decodes after np.conj, and the envelope --
+    hence the AM depth -- is unchanged by it."""
+    d = VorDemod(params())
+    obs = []
+    for blk in np.array_split(_am_carrier_at(OFFSET, 0.30, 4.0), 8):
+        obs += d.push(np.conj(blk))
+    assert abs(obs[-1].amp_a - 0.30) < 0.03, obs[-1].amp_a
 
 
 # --------------------------------------------------------------------------- #
@@ -298,6 +366,211 @@ def test_overlapping_windows_produce_more_observations():
 
 
 # --------------------------------------------------------------------------- #
+# amendment A25 -- channel filter and AFC
+# --------------------------------------------------------------------------- #
+
+def test_channel_filter_is_flat_across_the_subcarrier_band():
+    """A25: the original 12 kHz / 255-tap design was -2.5 dB at 9960 Hz and
+    -3.3 dB at the upper sideband -- rolling off inside the band it existed to
+    pass, and asymmetrically (FM-to-AM conversion). The shipped design must be
+    flat to within 0.5 dB over 9960 +/- 600 Hz and still reject the
+    intermediate-rate Nyquist."""
+    p = DspParams()                                   # production defaults
+    h = signal.firwin(p.channel_taps, p.channel_lp_hz, fs=p.fs)
+    f = [p.subcarrier_hz - 600, p.subcarrier_hz, p.subcarrier_hz + 600, 16_000]
+    _, H = signal.freqz(h, worN=f, fs=p.fs)
+    db = 20 * np.log10(np.abs(H))
+    assert db[0] > -0.5 and db[1] > -0.5 and db[2] > -0.5, db
+    assert abs(db[0] - db[2]) < 0.5, "sidebands attenuated asymmetrically"
+    assert db[3] < -30, "not enough rejection at the 32 kHz Nyquist"
+
+
+def _drifted(drift_hz, afc_threshold, seconds=20.0):
+    p = VorParams(radial_deg=137, fs=FS, seconds=seconds, offset_hz=OFFSET,
+                  snr_db=10.0, ident="TST", block=1 << 14, seed=1, drift_hz=drift_hz)
+    d = VorDemod(params(afc_threshold_hz=afc_threshold))
+    obs = []
+    for blk in generate_blocks(p):
+        obs += d.push(blk)
+    return obs, d
+
+
+def test_afc_pulls_a_displaced_carrier_back_into_the_passband():
+    """A25: a -4 kHz carrier offset (a ~40 ppm dongle, or a station at its
+    tolerance limit) puts the subcarrier sidebands into the filter's roll-off.
+    Without AFC the subcarrier level and recovered deviation fall and the
+    bearing noise roughly doubles; with it, all three recover and the measured
+    offset is reported."""
+    off, _ = _drifted(-4000.0, afc_threshold=0.0)
+    on, d = _drifted(-4000.0, afc_threshold=300.0)
+    late = slice(8, None)
+    sub_off = np.mean([o.sub_level for o in off[late]])
+    sub_on = np.mean([o.sub_level for o in on[late]])
+    assert sub_on > sub_off * 1.3, (sub_off, sub_on)
+    assert abs(on[-1].carrier_offset_hz + 4000.0) < 150, on[-1].carrier_offset_hz
+    assert abs(d.carrier_offset_hz + 4000.0) < 150
+    assert circ_spread(dphi_deg(on[late])) < circ_spread(dphi_deg(off[late]))
+    assert angdiff(circ_mean(dphi_deg(on[late])), circ_mean(dphi_deg(off[late]))) < 1.0
+
+
+def test_afc_leaves_an_on_frequency_signal_bit_identical():
+    """Below the threshold nothing is touched: the observations must be
+    exactly those of a build with AFC disabled, so the calibration and every
+    other test in this file are unaffected by its existence."""
+    a, _ = _drifted(0.0, afc_threshold=0.0, seconds=6.0)
+    b, d = _drifted(0.0, afc_threshold=300.0, seconds=6.0)
+    assert [(o.phi_a, o.phi_b, o.amp_a, o.amp_b) for o in a] == \
+           [(o.phi_a, o.phi_b, o.amp_a, o.amp_b) for o in b]
+    assert d._fine_hz == 0.0
+    assert abs(d.carrier_offset_hz) < 50
+
+
+def test_afc_is_cleared_by_reset():
+    """A retune must not carry the previous station's correction (F3)."""
+    _, d = _drifted(2500.0, afc_threshold=300.0, seconds=10.0)
+    assert d._fine_hz != 0.0
+    d.reset()
+    assert d._fine_hz == 0.0 and d.carrier_offset_hz == 0.0 and d._fine_phase == 0.0
+
+
+def test_afc_does_not_trigger_on_noise_alone():
+    """Noise is symmetric about zero, not about a carrier; the estimate must
+    stay near zero and never move the down-mix."""
+    rng = np.random.default_rng(7)
+    d = VorDemod(params(afc_threshold_hz=300.0))
+    for _ in range(40):
+        d.push((rng.normal(size=1 << 14) + 1j * rng.normal(size=1 << 14)).astype(np.complex64))
+    assert d._fine_hz == 0.0
+    assert abs(d.carrier_offset_hz) < 300
+
+
+# --------------------------------------------------------------------------- #
+# A28 -- which spectral sense does this dongle deliver?
+# --------------------------------------------------------------------------- #
+
+def test_sense_verdict_names_the_side_that_decodes():
+    from tools.vor_replay import pick_sense
+    # (AM depth, SNR dB) -- the real capture, measured both ways
+    swap, verdict = pick_sense((0.260, 38.1), (0.021, 11.6))
+    assert swap is False and "NORMAL" in verdict
+    swap, verdict = pick_sense((0.021, 11.6), (0.260, 38.1))
+    assert swap is True and "SWAPPED" in verdict and "tuner_profiles" in verdict
+
+
+def test_sense_verdict_refuses_to_choose_when_there_is_no_signal():
+    from tools.vor_replay import pick_sense
+
+    """F6: the flight read AM 0.005 either way. Picking a sense from noise
+    would be inventing a result -- and would send the next flight after the
+    wrong fault."""
+    swap, verdict = pick_sense((0.005, 2.6), (0.004, 2.1))
+    assert swap is False and "NEITHER" in verdict
+    assert "not your problem" in verdict
+
+
+def test_sense_verdict_flags_an_implausible_tie():
+    from tools.vor_replay import pick_sense
+
+    swap, verdict = pick_sense((0.20, 30.0), (0.16, 28.0))
+    assert "inconclusive" in verdict
+
+
+# --------------------------------------------------------------------------- #
+# D7 -- harmonic (maximum-likelihood) reference-tone estimator
+# --------------------------------------------------------------------------- #
+
+def _harm(radial, snr=None, seconds=12.0, seed=0, subcarrier_hz=9960.0, drop=5, **kw):
+    p = VorParams(radial_deg=radial, fs=FS, seconds=seconds, offset_hz=OFFSET,
+                  snr_db=snr, ident="TST", block=1 << 16, seed=seed,
+                  subcarrier_hz=subcarrier_hz)
+    d = VorDemod(params(fm_estimator="harmonic", **kw))
+    obs = []
+    for blk in generate_blocks(p):
+        obs += d.push(blk)
+    return obs[drop:]
+
+
+def test_harmonic_constant_is_the_same_across_radials():
+    """D7: the estimator's residual must be a constant, like the
+    discriminator's (M3 acceptance), so that one calibration serves every
+    radial. Measured spread is far tighter than the discriminator's."""
+    res = []
+    for radial in (0.0, 45.0, 137.0, 213.0, 300.0):
+        obs = _harm(radial)
+        res.append((radial - circ_mean(dphi_deg(obs)) + 180) % 360 - 180)
+    assert max(res) - min(res) < 0.05, res
+
+
+def test_harmonic_beats_the_discriminator_below_the_fm_threshold():
+    """D7, the point of it: at 3 dB channel SNR the conjugate-product
+    discriminator is below its threshold (recovered deviation collapses, FM
+    path 3x noisier than the AM path); the ML estimator has no threshold."""
+    p = VorParams(radial_deg=137, fs=FS, seconds=30.0, offset_hz=OFFSET,
+                  snr_db=3.0, ident="TST", block=1 << 16, seed=1)
+    blocks = list(generate_blocks(p))
+    out = {}
+    for est in ("discriminator", "harmonic"):
+        d = VorDemod(params(integration_s=2.0, fm_estimator=est))
+        obs = []
+        for blk in blocks:
+            obs += d.push(blk)
+        obs = obs[5:]
+        out[est] = (circ_spread(np.degrees([o.phi_b for o in obs])),
+                    circ_spread(dphi_deg(obs)),
+                    np.mean([o.amp_b for o in obs]))
+    fm_disc, brg_disc, dev_disc = out["discriminator"]
+    fm_harm, brg_harm, dev_harm = out["harmonic"]
+    assert fm_harm < fm_disc / 3, (fm_disc, fm_harm)
+    assert brg_harm < brg_disc / 2, (brg_disc, brg_harm)
+    assert dev_disc < 350 < 450 < dev_harm, (dev_disc, dev_harm)   # threshold collapse vs not
+
+
+def test_harmonic_tracks_the_station_subcarrier_offset():
+    """ICAO allows the 9960 Hz subcarrier +/- 1 %; the real station in the
+    tree sits at +40 Hz. The offset must be acquired and reported, and the
+    radial must come out unchanged."""
+    ref = _harm(137.0)
+    off = _harm(137.0, subcarrier_hz=10_000.0)
+    assert abs(np.mean([o.sub_offset_hz for o in off]) - 40.0) < 0.3
+    assert abs(np.mean([o.sub_offset_hz for o in ref])) < 0.3
+    assert angdiff(circ_mean(dphi_deg(off)), circ_mean(dphi_deg(ref))) < 0.1
+
+
+def test_harmonic_coherent_level_separates_noise_from_signal():
+    """`sub_level` is band power and includes the noise, which is why A11
+    could only use it as a presence check with a compressed range. The
+    coherent amplitude is near zero on noise alone."""
+    with_signal = np.mean([o.sub_coh for o in _harm(137.0, snr=10.0)])
+    rng = np.random.default_rng(3)
+    d = VorDemod(params(fm_estimator="harmonic"))
+    noise_obs = []
+    for _ in range(32):                                   # 8 s of noise
+        noise_obs += d.push((rng.normal(size=1 << 16)
+                             + 1j * rng.normal(size=1 << 16)).astype(np.complex64) * 0.3)
+    on_noise = np.mean([o.sub_coh for o in noise_obs[3:]])
+    assert with_signal > 0.2, with_signal
+    assert on_noise < 0.03, on_noise
+
+
+def test_harmonic_cvor_dvor_equivalence_and_its_own_calibration():
+    """A6 holds for the new estimator too, and its constant differs from the
+    discriminator's -- so `dsp.fm_estimator` and the calibration must match."""
+    from tools.vor_calibrate import solve
+    h = solve(FS, 6.0, verbose=False, fm_estimator="harmonic")
+    assert h["sign_margin_deg"] > 170
+    assert h["verify_error_deg"] < 0.05 and h["dvor_error_deg"] < 0.05
+    assert h["dvor_reversed_error_deg"] > 30
+    d = solve(FS, 6.0, verbose=False, fm_estimator="discriminator")
+    assert h["phase_sign"] == d["phase_sign"]
+    assert abs(h["phase_offset_deg"] - d["phase_offset_deg"]) > 0.5
+
+
+def test_discriminator_path_reports_no_harmonic_fields():
+    obs = run(137, seconds=4.0)
+    assert all(o.sub_offset_hz == 0.0 and o.sub_coh == 0.0 for o in obs)
+
+
+# --------------------------------------------------------------------------- #
 # amendment A9 -- the evidence, not the assertion
 # --------------------------------------------------------------------------- #
 
@@ -312,7 +585,7 @@ def _reference_tone_thd(deviation_hz: float, demod_rate: int, lp_hz: float) -> f
                   snr_db=None, ident="", deviation_hz=deviation_hz)
     z = np.concatenate(list(generate_blocks(p)))
     k = np.arange(z.size)
-    z = z * np.exp(2j * np.pi * (FS // 4) * k / FS)
+    z = z * np.exp(-2j * np.pi * (FS // 4) * k / FS)      # carrier at +fs/4 (A22)
     zc = signal.lfilter(signal.firwin(255, 12000, fs=FS), 1, z)[::FS // intermediate]
     env = np.abs(zc)
     al = np.exp(-1.0 / (0.5 * intermediate))

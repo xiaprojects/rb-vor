@@ -30,7 +30,7 @@ from rbvor.dsp import DspParams, VorDemod  # noqa: E402
 from rbvor.record import iq_blocks, read_sidecar  # noqa: E402
 
 FIELDS = ["t", "delta_phi_deg", "phi_a_deg", "phi_b_deg", "amp_a", "amp_b",
-          "sub_level", "carrier", "noise_est", "snr_db", "overrun"]
+          "sub_level", "carrier", "noise_est", "snr_db", "carrier_offset_hz", "overrun"]
 
 
 def band_survey(file, meta, block=1 << 17, nfft=1 << 14, search_khz=None):
@@ -64,11 +64,12 @@ def band_survey(file, meta, block=1 << 17, nfft=1 << 14, search_khz=None):
     freqs = np.fft.fftshift(np.fft.fftfreq(nfft, 1.0 / fs))   # baseband Hz
     psd_db = 10 * np.log10(psd / psd.max() + 1e-20)
 
-    # where the decoder EXPECTS the carrier in baseband: the generator places it
-    # at exp(j*2*pi*offset_hz*t), i.e. AT tuner_offset_hz (negative = below
-    # centre), and the DSP down-mixes by -offset_hz to bring it to zero. So the
-    # carrier sits at offset_hz, not its negation.
-    expected_hz = meta.tuner_offset_hz
+    # Where the decoder EXPECTS the carrier in baseband (A22): the tuner was
+    # parked at nav + tuner_offset_hz, so the navaid appears at
+    # nav - LO = -tuner_offset_hz. With the default -256 kHz offset that is
+    # +256 kHz, above centre. `dsp.py` mixes by +tuner_offset_hz to bring it
+    # to zero; `vor_gen.py` places it at the same spot.
+    expected_hz = -meta.tuner_offset_hz
 
     # search for the real peak. by default within +/- 100 kHz of expected, so a
     # strong adjacent FM broadcast image does not win.
@@ -85,13 +86,16 @@ def band_survey(file, meta, block=1 << 17, nfft=1 << 14, search_khz=None):
     peak_snr = peak_db - floor_db
 
     shift_hz = peak_hz - expected_hz
-    # translate the shift into a ppm error at the tuned RF frequency
+    # Translate the shift into the `sdr.ppm` value that would correct it. A
+    # crystal running p ppm FAST parks the LO p ppm high, so the carrier lands
+    # p ppm LOW in baseband: shift = -centre_rf * p * 1e-6, hence the sign.
     centre_rf = meta.nav_freq_hz + meta.tuner_offset_hz
-    ppm = (shift_hz / centre_rf) * 1e6 if centre_rf else float("nan")
+    ppm = (-shift_hz / centre_rf) * 1e6 if centre_rf else float("nan")
 
-    # mirror check: is there strong energy at the MIRROR of the expected
-    # position (i.e. at -expected_hz)? A spectrally-flipped capture -- common on
-    # some RTL-SDR setups -- puts the real signal on the wrong side of centre.
+    # Mirror check: is there strong energy at the MIRROR of the expected
+    # position (i.e. at -expected_hz)? A standard RTL-SDR does not mirror the
+    # band (A22); this fires for a genuinely inverted device, an I/Q-swapped
+    # capture path, or a synthetic file generated before A22.
     mirror_hz = -expected_hz
     # compare a small band around each (avoid the DC spike at centre)
     def band_peak_db(centre):
@@ -112,6 +116,7 @@ def band_survey(file, meta, block=1 << 17, nfft=1 << 14, search_khz=None):
             real_peak = float(freqs[b][np.argmax(psd[b])])
             mirror_shift_hz = real_peak - mirror_hz
             if centre_rf:
+                # on the mirrored side the baseband axis is inverted too
                 mirror_ppm = (mirror_shift_hz / centre_rf) * 1e6
 
     return {
@@ -136,14 +141,25 @@ def print_survey(s, meta):
     print(f"    carrier found  {s['peak_hz'] / 1e3:+.1f} kHz from centre, "
           f"{s['peak_snr']:.1f} dB above floor")
     print(f"    decoder expects{s['expected_hz'] / 1e3:+.1f} kHz "
-          f"(= tuner_offset)")
+          f"(= -tuner_offset, A22)")
     if s.get("mirrored"):
         print(f"    MIRROR DETECTED: energy at {s['mirror_hz']/1e3:+.1f} kHz is "
               f"{s['mir_db']-s['exp_db']:.1f} dB stronger than at the")
         print("                   expected position. The spectrum is FLIPPED --")
         print("                   the real signal is on the wrong side of centre.")
-        print("                   Fix: decode with --swap-iq, or set "
-              '"swap_iq": true in config.')
+        if meta.synthetic is not None and "carrier_at" not in meta.synthetic:
+            print("                   This is a synthetic file generated before "
+                  "amendment A22,")
+            print("                   which placed the carrier on the wrong side. "
+                  "Decode it with")
+            print("                   --swap-iq, or regenerate it.")
+        else:
+            print("                   A standard RTL-SDR does not do this (A22). "
+                  "Check for an I/Q")
+            print("                   swap in the capture path; if the dongle "
+                  "really is inverted,")
+            print("                   decode with --swap-iq or set "
+                  '"swap_iq": true in config.')
     if s.get("mirrored"):
         # When the band is mirrored, the peak-finder locks onto the real signal's
         # image and any "shift"/"ppm" it reports is an artifact of that, not a
@@ -163,7 +179,7 @@ def print_survey(s, meta):
                   "ppm may be worth setting")
     else:
         shift = s["shift_hz"]
-        if abs(shift) < fs / s["nfft"]:
+        if abs(shift) < 2 * fs / s["nfft"]:          # within the peak-finder's resolution
             print(f"    shift          {shift:+.0f} Hz -- on target, "
                   "decoder is looking in the right place")
         else:
@@ -214,6 +230,44 @@ def _ascii_spectrum(s, width=64, rows=12):
           "| = centre")
 
 
+def sense_score(obs, skip: int = 2) -> tuple[float, float]:
+    """(mean 30 Hz AM depth, mean 30 Hz SNR) over the usable windows.
+
+    AM depth is the discriminator: it is the field that carries the bearing,
+    and it is ~0.30 on a healthy station against ~0.00 on noise. `sub_level`
+    would not do -- it reads its own noise floor either way (D7).
+    """
+    kept = [o for o in obs[skip:] if not o.overrun]
+    if not kept:
+        return 0.0, 0.0
+    return (float(np.mean([o.amp_a for o in kept])),
+            float(np.mean([o.snr_db for o in kept])))
+
+
+def pick_sense(normal: tuple[float, float], swapped: tuple[float, float]) -> tuple[bool, str]:
+    """Which spectral sense decodes this capture? Returns (swap_needed, verdict).
+
+    A28/O21: the tuner decides this. librtlsdr runs the R820T in low-IF with
+    spectrum inversion; the FC0012 is zero-IF, so the two families can deliver
+    opposite senses and a convention measured on one is wrong on the other.
+    The answer is a measurement, not a judgement -- hence this.
+    """
+    am_n, am_s = normal[0], swapped[0]
+    best, other = max(am_n, am_s), min(am_n, am_s)
+    if best < 0.05:
+        return False, ("NEITHER sense decodes anything (AM depth ~0 both ways): no "
+                       "station on this channel, or nothing reaching the antenna -- "
+                       "the sense is not your problem")
+    if best < 2.0 * max(other, 1e-6):
+        return am_s > am_n, ("inconclusive: both senses read a similar AM depth, "
+                             "which should not happen on a real station -- check "
+                             "the capture before trusting either")
+    if am_s > am_n:
+        return True, ('SWAPPED sense decodes: set "swap_iq": true for THIS tuner '
+                      "(sdr.tuner_profiles), not globally")
+    return False, ('NORMAL sense decodes: leave "swap_iq" false for this tuner')
+
+
 def circ_mean_deg(x: np.ndarray) -> float:
     return float(np.rad2deg(np.angle(np.mean(np.exp(1j * np.deg2rad(x))))) % 360.0)
 
@@ -242,9 +296,9 @@ def main(argv=None) -> int:
     ap.add_argument("--survey-span-khz", type=float, default=100,
                     help="+/- kHz around the expected carrier to search for the peak")
     ap.add_argument("--swap-iq", action="store_true",
-                    help="conjugate IQ to un-mirror a spectrally-flipped capture "
-                         "(some RTL-SDR setups mirror the band; the survey shows "
-                         "the carrier on the wrong side of centre)")
+                    help="conjugate IQ to un-mirror a spectrally-flipped capture: "
+                         "a genuinely inverted device, or a synthetic file made "
+                         "before amendment A22 (the survey says which)")
     ap.add_argument("--list", action="store_true",
                     help="print every window's radial, not just the mean -- shows "
                          "how the bearing moves within one capture")
@@ -253,9 +307,21 @@ def main(argv=None) -> int:
                          "not raw delta_phi")
     ap.add_argument("--phase-offset", type=float, default=0.0,
                     help="phase_offset_deg + station_cal_deg to add after phase_sign")
+    ap.add_argument("--fm-estimator", choices=("discriminator", "harmonic"),
+                    default="discriminator", help="reference-tone estimator (D7)")
+    ap.add_argument("--auto-swap", action="store_true",
+                    help="decode BOTH spectral senses and report which one works, "
+                         "then continue with the winner. This is the test for "
+                         "'does my dongle need swap_iq' (A28/O21)")
     a = ap.parse_args(argv)
 
     meta = read_sidecar(a.file)
+    if (meta.synthetic is not None and "carrier_at" not in meta.synthetic
+            and not a.swap_iq):
+        print(f"{a.file}: synthetic file generated before amendment A22 -- the "
+              "carrier is on the wrong side of centre. Decoding it needs "
+              "--swap-iq, or regenerate it with the current tools/vor_gen.py.",
+              file=sys.stderr)
 
     if a.survey:
         s = band_survey(a.file, meta, block=a.block, nfft=a.survey_nfft,
@@ -286,12 +352,30 @@ def main(argv=None) -> int:
         return 2
 
     p = DspParams(fs=meta.sample_rate_hz, offset_hz=meta.tuner_offset_hz,
-                  integration_s=a.integration, hop_s=a.hop)
+                  integration_s=a.integration, hop_s=a.hop,
+                  fm_estimator=a.fm_estimator)
     d = VorDemod(p)
 
-    obs = []
-    for blk in iq_blocks(a.file, block_samples=a.block, meta=meta):
-        obs += d.push(np.conj(blk) if a.swap_iq else blk)
+    if a.auto_swap:
+        d_swapped = VorDemod(p)
+        obs, obs_swapped = [], []
+        for blk in iq_blocks(a.file, block_samples=a.block, meta=meta):
+            obs += d.push(blk)
+            obs_swapped += d_swapped.push(np.conj(blk))
+        normal, swapped = sense_score(obs, a.skip), sense_score(obs_swapped, a.skip)
+        use_swapped, verdict = pick_sense(normal, swapped)
+        print(f"file            {a.file}")
+        print("  spectral sense test (A28)")
+        print(f"    normal       AM depth {normal[0]:.3f}   30 Hz SNR {normal[1]:6.1f} dB")
+        print(f"    swapped      AM depth {swapped[0]:.3f}   30 Hz SNR {swapped[1]:6.1f} dB")
+        print(f"    -> {verdict}")
+        print()
+        if use_swapped:
+            obs = obs_swapped
+    else:
+        obs = []
+        for blk in iq_blocks(a.file, block_samples=a.block, meta=meta):
+            obs += d.push(np.conj(blk) if a.swap_iq else blk)
 
     if len(obs) <= a.skip:
         print(f"{a.file}: only {len(obs)} windows -- capture too short", file=sys.stderr)
@@ -309,7 +393,8 @@ def main(argv=None) -> int:
                             f"{np.rad2deg(o.phi_a):.4f}", f"{np.rad2deg(o.phi_b):.4f}",
                             f"{o.amp_a:.5f}", f"{o.amp_b:.2f}", f"{o.sub_level:.5f}",
                             f"{o.carrier:.6g}", f"{o.noise_est:.6f}",
-                            f"{o.snr_db:.2f}", int(o.overrun)])
+                            f"{o.snr_db:.2f}", f"{o.carrier_offset_hz:.1f}",
+                            int(o.overrun)])
 
     dphi = np.array([np.rad2deg(o.delta_phi) % 360.0 for o in kept])
     mean = circ_mean_deg(dphi)
@@ -329,6 +414,13 @@ def main(argv=None) -> int:
           "nominal 0.30 (band measurement, A7)")
     print(f"  deviation       {np.mean([o.amp_b for o in kept]):8.1f} Hz  nominal 480")
     print(f"  30 Hz SNR       {np.mean([o.snr_db for o in kept]):8.1f} dB")
+    if a.fm_estimator == "harmonic":
+        print(f"  subcarrier      {np.mean([o.sub_offset_hz for o in kept]):+8.1f} Hz from "
+              f"9960, coherent level {np.mean([o.sub_coh for o in kept]):.3f} (D7)")
+    afc = kept[-1].carrier_offset_hz
+    if abs(afc) >= 50 and meta.nav_freq_hz:
+        print(f"  carrier offset  {afc:+8.0f} Hz  ({afc / meta.nav_freq_hz * 1e6:+.1f} ppm, "
+              "AFC-corrected, A25)")
 
     if a.list:
         # per-window radial, so a moving receiver (a car orbit, a flight leg)

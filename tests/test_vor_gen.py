@@ -76,7 +76,8 @@ def reference_decode(z: np.ndarray, fs: int = FS, offset_hz: int = OFFSET,
                      seconds: float = 2.0) -> dict:
     """Naive, slow, correct-by-inspection VOR decoder used only for testing."""
     n = np.arange(z.size)
-    base = z * np.exp(-2j * np.pi * offset_hz * n / fs)     # down-mix to DC
+    # the carrier is at -offset_hz (A22); mixing by +offset_hz brings it to DC
+    base = z * np.exp(2j * np.pi * offset_hz * n / fs)
     env = np.abs(base).astype(np.float64)
     carrier = float(np.mean(env))
     audio = env - carrier
@@ -174,11 +175,24 @@ def test_sample_count_and_dtype():
 # spectral content
 # --------------------------------------------------------------------------- #
 
-def test_carrier_sits_at_the_tuner_offset():
+def test_carrier_sits_where_a_tuner_at_nav_plus_offset_puts_it():
+    """A22: the tuner is parked at nav + offset, so the navaid appears at
+    nav - LO = -offset in baseband. With offset = -fs/4 that is +fs/4."""
     z = gen(0, seconds=1.0)
     spec = np.abs(np.fft.fftshift(np.fft.fft(z)))
     f = np.fft.fftshift(np.fft.fftfreq(z.size, 1.0 / FS))
-    assert abs(f[int(np.argmax(spec))] - OFFSET) < 2.0
+    assert abs(f[int(np.argmax(spec))] - (-OFFSET)) < 2.0
+
+
+def test_sidecar_records_the_carrier_convention(tmp_path):
+    """Files made before A22 have no `carrier_at`; new ones say `-offset`, so
+    a replay tool can tell the two apart instead of guessing."""
+    from rbvor.record import read_sidecar
+    from tools.vor_gen import write_file
+    p = VorParams(radial_deg=10, fs=FS, seconds=0.5, offset_hz=OFFSET, block=1 << 14)
+    path = write_file(p, tmp_path / "s", fmt="cu8")
+    meta = read_sidecar(path)
+    assert meta.synthetic["carrier_at"] == "-offset"
 
 
 def test_modulation_depths_match_the_commanded_values():

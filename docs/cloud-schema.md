@@ -39,6 +39,9 @@ Schema `rb-vor.solution/1`.
 | `deviation_hz` | Hz | measured FM deviation, nominal 480 |
 | `carrier` | a.u. | smoothed carrier magnitude |
 | `snr_db` | dB | post-integration 30 Hz tone SNR |
+| `carrier_offset_hz` | Hz | carrier offset from the nominal down-mix, AFC-corrected (A25); ppm = value / channel_khz / 1000 |
+| `sub_offset_hz` | Hz | station subcarrier offset from 9960 Hz (harmonic estimator, D7; else 0) |
+| `sub_coh` | frac | coherent subcarrier amplitude x2 (harmonic estimator, D7; else 0) |
 | `gps_track` | deg true | aircraft track from the bridge, diagnostics only |
 | `overrun` | bool | window touched a sample gap (discarded if true) |
 | `iq_ref` | filename | IQ capture that includes this window, if any |

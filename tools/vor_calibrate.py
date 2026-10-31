@@ -47,12 +47,16 @@ from tools.vor_gen import VorParams, generate_blocks  # noqa: E402
 
 def decode_delta_phi(radial: float, vor_type: str = "cvor", fs: int = 256_000,
                      seconds: float = 6.0, snr_db: float | None = None,
-                     skip: int = 2, deviation_hz: float = 480.0) -> float:
+                     skip: int = 2, deviation_hz: float = 480.0,
+                     fm_estimator: str = "discriminator") -> float:
     """Mean phase difference in degrees for a commanded radial."""
     p = VorParams(radial_deg=radial, vor_type=vor_type, fs=fs, seconds=seconds,
                   offset_hz=-fs // 4, snr_db=snr_db, ident="",
                   deviation_hz=deviation_hz, block=1 << 16)
-    d = VorDemod(DspParams(fs=fs, offset_hz=-fs // 4))
+    # the harmonic estimator (D7) needs a few windows to acquire the subcarrier
+    # offset; give it the same warm-up the discriminator's filters get
+    skip = max(skip, 4) if fm_estimator == "harmonic" else skip
+    d = VorDemod(DspParams(fs=fs, offset_hz=-fs // 4, fm_estimator=fm_estimator))
     obs = []
     for blk in generate_blocks(p):
         obs += d.push(blk)
@@ -62,10 +66,12 @@ def decode_delta_phi(radial: float, vor_type: str = "cvor", fs: int = 256_000,
     return circular_mean([np.rad2deg(o.delta_phi) % 360.0 for o in used])
 
 
-def solve(fs: int, seconds: float, verbose: bool = True) -> dict:
+def solve(fs: int, seconds: float, verbose: bool = True,
+          fm_estimator: str = "discriminator") -> dict:
     r1, r2, r3 = 0.0, 90.0, 213.0
-    d1 = decode_delta_phi(r1, fs=fs, seconds=seconds)
-    d2 = decode_delta_phi(r2, fs=fs, seconds=seconds)
+    dec = {"fs": fs, "seconds": seconds, "fm_estimator": fm_estimator}
+    d1 = decode_delta_phi(r1, **dec)
+    d2 = decode_delta_phi(r2, **dec)
 
     candidates = {}
     for sign in (1, -1):
@@ -84,17 +90,17 @@ def solve(fs: int, seconds: float, verbose: bool = True) -> dict:
     offset = wrap180(candidates[best]["offset"])
 
     # verification on an unrelated radial
-    d3 = decode_delta_phi(r3, fs=fs, seconds=seconds)
+    d3 = decode_delta_phi(r3, **dec)
     got3 = (sign * d3 + offset) % 360.0
     err3 = angular_difference(got3, r3)
 
     # amendment A6: DVOR must decode identically at the SAME sign
-    d_dvor = decode_delta_phi(r3, vor_type="dvor", fs=fs, seconds=seconds)
+    d_dvor = decode_delta_phi(r3, vor_type="dvor", **dec)
     got_dvor = (sign * d_dvor + offset) % 360.0
     err_dvor = angular_difference(got_dvor, r3)
 
     # and the deliberately-wrong DVOR must not
-    d_rev = decode_delta_phi(r3, vor_type="dvor-reversed", fs=fs, seconds=seconds)
+    d_rev = decode_delta_phi(r3, vor_type="dvor-reversed", **dec)
     got_rev = (sign * d_rev + offset) % 360.0
     err_rev = angular_difference(got_rev, r3)
 
@@ -108,6 +114,7 @@ def solve(fs: int, seconds: float, verbose: bool = True) -> dict:
         "dvor_reversed_error_deg": round(float(err_rev), 4),
         "fs": fs,
         "seconds": seconds,
+        "fm_estimator": fm_estimator,
     }
 
     if verbose:
@@ -119,7 +126,7 @@ def solve(fs: int, seconds: float, verbose: bool = True) -> dict:
         print(f"  decision margin {margin:.3f} deg")
         print()
         print(f"phase_sign        {sign:+d}")
-        print(f"phase_offset_deg  {offset:+.4f}")
+        print(f"phase_offset_deg  {offset:+.4f}   (dsp.fm_estimator: {fm_estimator})")
         print()
         print(f"verify  CVOR   radial {r3:.0f} -> {got3:8.3f}  error {err3:.4f} deg")
         print(f"        DVOR   radial {r3:.0f} -> {got_dvor:8.3f}  error {err_dvor:.4f} "
@@ -140,9 +147,13 @@ def main(argv=None) -> int:
     ap.add_argument("--seconds", type=float, default=6.0)
     ap.add_argument("--json", type=Path, default=None,
                     help="write a config fragment for bearing.*")
+    ap.add_argument("--fm-estimator", choices=("discriminator", "harmonic"),
+                    default="discriminator",
+                    help="must match dsp.fm_estimator in the config: the two "
+                         "estimators have different constants (D7)")
     a = ap.parse_args(argv)
 
-    r = solve(a.fs, a.seconds)
+    r = solve(a.fs, a.seconds, fm_estimator=a.fm_estimator)
 
     if r["sign_margin_deg"] < 90.0:
         print("\nFAIL: sign decision is not decisive", file=sys.stderr)

@@ -45,6 +45,18 @@ decimation-phase mismatch between the two paths.
 > one author's sign conventions and could be consistently wrong together. Only a
 > capture of a real station with a known radial settles it.
 
+**Two estimators, two constants (D7).** `dsp.fm_estimator` selects how the
+reference tone is recovered, and the calibration must be derived with the
+same setting:
+
+| `dsp.fm_estimator` | command | result on this baseline |
+|---|---|---|
+| `discriminator` (shipped default) | `tools/vor_calibrate.py` | `+1`, `−1.9663` |
+| `harmonic` | `tools/vor_calibrate.py --fm-estimator harmonic` | `+1`, `−0.6077` |
+
+A config that pairs one estimator with the other's constant publishes
+bearings 1.36° off. The self-test reports which estimator the config uses.
+
 ## 2. Closing O1 with one capture
 
 ```bash

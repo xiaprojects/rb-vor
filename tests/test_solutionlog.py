@@ -170,10 +170,66 @@ def test_trigger_writes_ring_with_a_reason(tmp_path):
         r.push(np.full(FS // 10, 0.2, dtype=np.complex64))
     path = r.trigger(reason="no subcarrier", extra={"channel_khz": 109_400})
     assert path is not None and path.exists()
+    r.flush()
     m = read_sidecar(path)
     assert "no subcarrier" in m.notes
     assert m.synthetic is None
     assert r.captures_written == 1
+
+
+def test_ring_is_held_quantised_and_trigger_does_not_block_the_caller(tmp_path):
+    """D6: the ring costs 2 bytes per cu8 sample, not 8, and a trigger hands
+    the write to a thread instead of stalling the sample pump for seconds.
+    The file must nevertheless be byte-for-byte what a synchronous write would
+    have produced."""
+    import time
+
+    from rbvor.record import encode_complex, iq_blocks
+    r = RingRecorder(_meta(), tmp_path, max_seconds=3.0, fmt="cu8")
+    rng = np.random.default_rng(5)
+    blocks = [(0.3 * (rng.normal(size=FS // 4) + 1j * rng.normal(size=FS // 4)))
+              .astype(np.complex64) for _ in range(12)]          # 3 s exactly
+    for b in blocks:
+        r.push(b)
+    assert sum(c.nbytes for c in r._ring) == 2 * r._held      # quantised in place
+    assert all(c.dtype == np.uint8 for c in r._ring)
+    t0 = time.perf_counter()
+    path = r.trigger(reason="bench")
+    assert time.perf_counter() - t0 < 0.25, "trigger blocked the caller"
+    r.flush()
+    want = np.concatenate([encode_complex(b, "cu8") for b in blocks])
+    got = np.fromfile(path, dtype=np.uint8)
+    assert np.array_equal(got, want)
+    back = np.concatenate(list(iq_blocks(path)))
+    assert back.size == r._held
+    m = read_sidecar(path)
+    assert m.samples == r._held and abs(m.duration_s - 3.0) < 1e-9
+
+
+def test_trigger_while_a_write_is_in_flight_is_skipped_not_queued(tmp_path, monkeypatch):
+    """Consecutive flags a second apart must not pile up copies of the same
+    samples; the capture in flight already holds the evidence."""
+    import threading
+
+    from rbvor import record as rec
+    gate = threading.Event()
+    orig_write = rec.IQWriter.write
+
+    def slow_write(self, raw):
+        gate.wait(5.0)
+        orig_write(self, raw)
+
+    monkeypatch.setattr(rec.IQWriter, "write", slow_write)
+    r = RingRecorder(_meta(), tmp_path, max_seconds=2.0, fmt="cu8")
+    r.push(np.full(FS // 10, 0.2, dtype=np.complex64))
+    first = r.trigger("first")
+    assert first is not None
+    assert r.trigger("second") is None and r.captures_skipped == 1
+    gate.set()
+    r.flush()
+    assert r.captures_written == 1
+    assert r.trigger("third") is not None            # free again once written
+    r.flush()
 
 
 def test_trigger_on_empty_ring_returns_none(tmp_path):
@@ -260,6 +316,33 @@ def test_flag_triggers_an_iq_capture_referenced_in_the_row(tmp_path):
     assert any(r.iq_ref == captures[0].name for r in flagged_rows)
 
 
+def test_flag_capture_names_the_channel_it_was_tuned_to(tmp_path):
+    """The daemon builds the recorder template before it knows the channel,
+    so every flag capture used to be written as `capture_..._0.cu8` with
+    `nav_freq_hz: 0` and `center_freq_hz: 0` -- a file `vor_replay.py` could
+    not place the carrier in. The retune must tell the recorder the channel."""
+    cfg = _cfg(tmp_path, trigger="on_flag")
+    clock = FakeClock()
+    meta = IQMeta(format="cu8", sample_rate_hz=FS, center_freq_hz=0,
+                  nav_freq_hz=0, tuner_offset_hz=-FS // 4)     # as __main__ does
+    recorder = RingRecorder(meta, tmp_path / "iq", max_seconds=3.0, fmt="cu8")
+    c = Controller(cfg, FakeSdr(), Publisher(cfg.publish, RecordingTransport(),
+                                             clock=clock),
+                   clock=clock, recorder=recorder)
+    _drive(c, clock, 137, seconds=4.0)
+    noise = (np.random.default_rng(0).normal(size=FS * 3)
+             + 1j * np.random.default_rng(1).normal(size=FS * 3)).astype(np.complex64)
+    for i in range(0, noise.size, 1 << 15):
+        clock.advance(0.1)
+        c.push(noise[i:i + (1 << 15)])
+    captures = list((tmp_path / "iq").glob("*.cu8"))
+    assert captures and captures[0].name.endswith("_109400.cu8"), captures
+    recorder.flush()
+    m = read_sidecar(captures[0])
+    assert m.nav_freq_hz == 109_400_000
+    assert m.center_freq_hz == 109_400_000 - FS // 4
+
+
 def test_no_recorder_and_no_sink_is_the_default_and_changes_nothing(tmp_path):
     """Every pre-M9 test constructs the controller without these; the bearing
     path must be identical."""
@@ -273,6 +356,6 @@ def test_no_recorder_and_no_sink_is_the_default_and_changes_nothing(tmp_path):
     c = Controller(cfg, FakeSdr(), Publisher(cfg.publish, t, clock=clock),
                    clock=clock)
     _drive(c, clock, 213)
-    good = [s for s in t.sent if s["vorstatus"] >= 4]     # A20: status is the gate
+    good = [s for s in t.sent if s["vorsnr"] > 0]
     assert good and all(abs(((s["vorradial"] - 213 + 180) % 360) - 180) <= 3
                         for s in good)

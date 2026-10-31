@@ -69,10 +69,10 @@ class FakePublisher:
         vorsignal = 1 if valid else 0
         self.sent.append((vordir if valid else None, vorsignal, state, reason,
                           snr_db, am_depth, status, sub_level, freq_khz))
-        self.raw.append(dict(vordir=vordir, snr_db=snr_db, am_depth=am_depth,
-                             state=state, valid=valid, status=status,
-                             sub_level=sub_level, freq_khz=freq_khz,
-                             reason=reason))
+        self.raw.append({"vordir": vordir, "snr_db": snr_db, "am_depth": am_depth,
+                             "state": state, "valid": valid, "status": status,
+                             "sub_level": sub_level, "freq_khz": freq_khz,
+                             "reason": reason})
 
     @property
     def last(self):
@@ -89,6 +89,11 @@ def make(calibrated=True, **overrides):
     raw["sdr"]["tuner_offset_hz"] = -FS // 4
     if calibrated:
         raw["bearing"].update(phase_sign=1, phase_offset_deg=-1.9657)
+    else:
+        # A2 is a mechanism, not a property of the shipped file: since 1.0.0
+        # the shipped config carries the flight calibration, so the
+        # uncalibrated case must be constructed explicitly.
+        raw["bearing"].update(phase_sign=None, phase_offset_deg=None)
     for section, kv in overrides.items():
         raw[section].update(kv)
     cfg = Config(raw=raw)

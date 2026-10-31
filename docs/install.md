@@ -72,8 +72,8 @@ the calibration is only self-consistent (open item O1).
 | `usb_claim_interface error -6` | the kernel DVB-T driver claimed the dongle | the installer blacklists it; reboot, or `sudo rmmod dvb_usb_rtl28xxu` |
 | Device not found as `rb-vor` user | udev rule not applied | `sudo udevadm control --reload-rules && sudo udevadm trigger`, replug |
 | Tunes but nothing decodes, RTL-SDR Blog V4 | stock `librtlsdr` does not drive the V4's R828D tuner | install the rtl-sdr-blog fork (§4.1) |
-| `vorsignal` always 0, `q_sub` near zero | no subcarrier — wrong frequency, or a localiser | check the channel against §2.2 of the interface spec |
-| `vorsignal` always 0, everything else looks fine | uncalibrated | §3 |
+| `vorstatus` stuck at 1, `vorsub` near zero | no subcarrier — wrong frequency, or a localiser | check the channel against §2.2 of the interface spec |
+| `vorstatus` never reaches 4, radial 0, measurements healthy, status line says `uncalibrated` | uncalibrated | §3 |
 | Bearing is stable but wrong by a constant | `station_cal_deg` or an inverted `phase_sign` | `calibration.md`, table in §2 |
 | Bearing wanders, `q_stab` low | weak signal, FM breakthrough, or a vertical antenna | fit the band-stop, turn the antenna horizontal |
 | Nothing decodes; `vor_replay.py --survey` reports **MIRROR DETECTED** | the RTL-SDR is delivering a spectrally-flipped band; the signal is on the wrong side of centre | set `"swap_iq": true` in the `sdr` block, or decode captures with `--swap-iq` |

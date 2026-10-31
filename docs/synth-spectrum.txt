@@ -1,0 +1,21 @@
+file          /tmp/ref137.cu8
+format        cu8  fs 1024 kHz  4.00 s  (synthetic)
+context       TST @  synthetic cvor
+nav freq      109.400 MHz
+tuner offset  sidecar -256.0 kHz, measured -256.000 kHz (error +0.0 Hz)
+
+  component            depth    nominal   verdict
+  30 Hz AM              0.245    0.30     ok
+  9960 Hz subcarrier    0.247    0.30     ok
+  1020 Hz ident         0.047       -     present
+  noise floor 4-8 kHz   0.041
+  30 Hz SNR              15.5 dB
+
+  subcarrier measured as a narrow bin at 9960 Hz: 0.0434
+    ^ expected to be far below the band figure: with beta = 16 the
+      component at 9960 Hz itself is only J0(16) = -0.175 of the
+      total. Gauge the BAND, never the bin (amendment A7).
+
+  expected radial 137.0 deg (from sidecar; decoding is M3)
+
+  wrote docs/synth-spectrum.png

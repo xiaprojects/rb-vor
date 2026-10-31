@@ -65,6 +65,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--agc", action="store_true", help="hardware AGC instead of --gain")
     p.add_argument("--ppm", type=int, default=0)
     p.add_argument("--device", default="", help="SoapySDR device args or serial")
+    p.add_argument("--device-serial", default="",
+                   help="A27: open the RTL-SDR with this USB serial, whatever its "
+                        "index. Prefer this over --device-index: enumeration order "
+                        "is not stable when several dongles are fitted.")
+    p.add_argument("--device-index", type=int, default=0,
+                   help="A27: which RTL-SDR to open (default 0). Ignored when "
+                        "--device-serial is given.")
     p.add_argument("--backend", choices=["auto", "soapy", "pyrtlsdr", "rtl_sdr"],
                    default="auto")
     p.add_argument("--allow-non-vor", action="store_true",
@@ -81,6 +88,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--filter-chain", default="")
     p.add_argument("--notes", default="")
     return p.parse_args(argv)
+
+
+def resolve(args):
+    """(index, description) of the dongle to capture from -- same policy as the
+    daemon (`rbvor.sdr.resolve_device`), so a capture and a live decode can
+    never disagree about which antenna they were listening to (A27, F6)."""
+    from rbvor.sdr import resolve_device, rtl_serials
+    choice = resolve_device({"device_serial": args.device_serial,
+                             "device_index": args.device_index}, rtl_serials())
+    if choice.warning:
+        print(f"  warning: {choice.warning}", file=sys.stderr)
+    return choice
 
 
 def build_meta(args, fmt: str, center: int, nav: int, driver: str, device: str) -> IQMeta:
@@ -116,6 +135,10 @@ def capture_soapy(args, center: int, nav: int, out: Path) -> Path:
     from SoapySDR import SOAPY_SDR_CS8, SOAPY_SDR_RX  # type: ignore
 
     dev_args = args.device or "driver=rtlsdr"
+    if args.device_serial and "serial=" not in dev_args:
+        dev_args = f"{dev_args},serial={args.device_serial}"
+    elif not args.device_serial and "rtl=" not in dev_args and "serial=" not in dev_args:
+        dev_args = f"{dev_args},rtl={args.device_index}"
     sdr = SoapySDR.Device(dict(kv.split("=", 1) for kv in dev_args.split(",") if "=" in kv)
                           if "=" in dev_args else dev_args)
     sdr.setSampleRate(SOAPY_SDR_RX, 0, args.fs)
@@ -155,12 +178,13 @@ def capture_soapy(args, center: int, nav: int, out: Path) -> Path:
 def capture_pyrtlsdr(args, center: int, nav: int, out: Path) -> Path:
     from rtlsdr import RtlSdr  # type: ignore
 
-    sdr = RtlSdr()
+    choice = resolve(args)
+    sdr = RtlSdr(device_index=choice.index)
     sdr.sample_rate = args.fs
     sdr.center_freq = center
     sdr.freq_correction = args.ppm if args.ppm else 1
     sdr.gain = "auto" if args.agc else args.gain
-    meta = build_meta(args, "cu8", center, nav, "pyrtlsdr", "index=0")
+    meta = build_meta(args, "cu8", center, nav, "pyrtlsdr", choice.detail)
     target = int(args.seconds * args.fs)
     try:
         with IQWriter(out, meta) as w:
@@ -183,7 +207,9 @@ def capture_rtl_sdr_cli(args, center: int, nav: int, out: Path) -> Path:
     # rtl_sdr writes unsigned 8-bit offset binary -- cu8, see amendment A4.
     path = Path(str(out) + ".cu8")
     path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [exe, "-f", str(center), "-s", str(args.fs), "-n", str(target),
+    choice = resolve(args)
+    cmd = [exe, "-d", str(choice.index),
+           "-f", str(center), "-s", str(args.fs), "-n", str(target),
            "-p", str(args.ppm)]
     if args.agc:
         cmd += ["-g", "0"]
@@ -192,7 +218,7 @@ def capture_rtl_sdr_cli(args, center: int, nav: int, out: Path) -> Path:
     cmd.append(str(path))
     print("  $ " + " ".join(cmd))
     subprocess.run(cmd, check=True)
-    meta = build_meta(args, "cu8", center, nav, "rtl_sdr", "index=0")
+    meta = build_meta(args, "cu8", center, nav, "rtl_sdr", choice.detail)
     meta.samples = path.stat().st_size // 2
     meta.duration_s = meta.samples / float(args.fs)
     from rbvor.record import write_sidecar
@@ -238,7 +264,8 @@ def main(argv=None) -> int:
             print(f"\n  wrote {path}  ({time.time()-t0:.1f} s wall)")
             print(f"  sidecar {path.with_suffix('.json')}")
             return 0
-        except (ImportError, RuntimeError, FileNotFoundError, OSError) as e:
+        except (ImportError, RuntimeError, FileNotFoundError, OSError,
+                AttributeError) as e:      # AttributeError: librtlsdr mismatch, O7
             print(f"  backend {name} unavailable: {e}", file=sys.stderr)
             last_err = e
     print(f"no working SDR backend: {last_err}", file=sys.stderr)

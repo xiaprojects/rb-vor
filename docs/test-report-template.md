@@ -71,7 +71,7 @@ Decision: is BOM item 3 (airband LNA) needed here? __________
 | overruns | should be 0 |
 | read_errors | should be 0 |
 | queued (steady) | |
-| typical `vorsignal` while tracking | |
+| typical `vorsnr` / `voram` / `vorsub` while tracking | |
 
 ## Stage 7 — O1, calibration vs a real station
 
@@ -118,8 +118,8 @@ python3 tools/vor_replay.py captures/<file>.cu8
 
 | | Answer |
 |---|---|
-| bridge expects `vorsignal` as | 0–100 / 0/1 |
-| bridge expects `vordir` as | from / to |
+| bridge expects `vorradial` as | from / to (O4) |
+| O3 (`vorsignal` scale) | moot since RB-VOR-IF v2.0: no synthetic score on the wire |
 | `mock_bridge.py` reported any payload deviation? | |
 
 ## Attachments

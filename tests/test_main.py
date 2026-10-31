@@ -61,9 +61,45 @@ def _bench_config(tmp_path: Path) -> Path:
     cfg["sdr"]["sample_rate_hz"] = 256000
     cfg["sdr"]["tuner_offset_hz"] = -64000
     cfg["bearing"].update(phase_sign=1, phase_offset_deg=-1.9657)
+    cfg["log"]["solution_csv"] = str(tmp_path / "solutions.csv")
     p = tmp_path / "bench.json"
     p.write_text(json.dumps(cfg, indent=2))
     return p
+
+
+def test_unopenable_sdr_stops_the_daemon_with_exit_code_3(tmp_path, monkeypatch):
+    """F3 (CLAUDE.md): a task that dies must take the daemon down.
+
+    Seen in the field: with no openable dongle, `tick()` raised SdrError inside
+    the ticker task, nobody awaited it, and the process idled for ten minutes
+    printing `blocks_read: 0`. `main()`'s `except SdrError` only guarded
+    `asyncio.run`, so exit code 3 was never produced. Without the fix this test
+    hangs until the timeout instead of raising.
+    """
+    import argparse
+    import asyncio
+
+    import pytest
+
+    from rbvor import sdr as sdr_mod
+    from rbvor.__main__ import _run, main
+    from rbvor.config import load
+    from rbvor.sdr import SdrError
+
+    def refuse(cfg, order=None):
+        raise SdrError("no usable SDR backend (test double)")
+
+    monkeypatch.setattr(sdr_mod, "open_device", refuse)
+    cfg_path = _bench_config(tmp_path)
+    args = argparse.Namespace(dry_run=True, replay=None, freq=109.4, quiet=True,
+                              status_every=2.0, log_level=None, csv=None)
+    with pytest.raises(SdrError):
+        asyncio.run(asyncio.wait_for(_run(load(cfg_path), args), timeout=15))
+
+    # and the CLI turns it into the documented exit code, not a hang
+    rc = main(["--config", str(cfg_path), "--freq", "109.4", "--dry-run",
+               "--quiet", "--log-level", "ERROR"])
+    assert rc == 3
 
 
 def test_self_test_passes_without_any_config_present(tmp_path):

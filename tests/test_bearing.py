@@ -156,3 +156,15 @@ def test_tracker_smoothing_crosses_north_correctly():
     for d in (359.0, 0.0, 1.0):
         out = t.update(math.radians(d))
     assert angular_difference(out, 0.0) < 1e-6
+
+
+def test_tracker_survives_a_window_that_cancels_out():
+    """0 and 180 in a two-deep window have no circular mean. That must not
+    raise out of the bearing path (it would kill the sample pump, F3); the
+    newest raw value is returned and q_stab is left to flag the dispersion."""
+    cal = BearingCal(phase_sign=1, phase_offset_deg=0.0, smooth_n=2)
+    t = BearingTracker(cal)
+    t.update(math.radians(0.0))
+    out = t.update(math.radians(180.0))
+    assert out == pytest.approx(180.0)
+    assert t.raw == pytest.approx(180.0)

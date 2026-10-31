@@ -10,39 +10,47 @@
     "http_timeout_s": 0.8
   },
   "publish": {
-    "mode": "periodic",
-    "period_s": 1.0,
-    "deadband_deg": 1,
     "keepalive_s": 5.0,
     "hold_s": 3.0,
-    "signal_scale": "percent",
     "bearing_ref": "from"
   },
   "sdr": {
     "driver": "pyrtlsdr",
     "device_args": "driver=rtlsdr",
+    "device_serial": "",
+    "device_index": 0,
     "sample_rate_hz": 1024000,
     "tuner_offset_hz": -256000,
     "gain_mode": "manual",
-    "gain_db": 14.4,
-    "ppm": 2,
+    "gain_db": 19.2,
+    "ppm": 9,
     "bias_tee": false,
-    "swap_iq": true,
+    "swap_iq": false,
+    "tuner_profiles": {
+      "FC0012": {
+        "gain_db": 19.2,
+        "_note": "VOR antenna in this aircraft. Five gain steps, max 19.2 dB. Zero-IF: if `vor_replay.py --auto-swap` on a capture from THIS dongle says the swapped sense wins, add \"swap_iq\": true HERE -- not globally, the bench R820T does not want it (CLAUDE.md A28, open item O21)."
+      },
+      "R820T": {
+        "gain_db": 32.8,
+        "_note": "bench/car dongle; every convention in CLAUDE.md was measured on it"
+      }
+    },
     "settle_ms": 250,
     "buffer_blocks": 16,
-    "block_samples": 32768
+    "block_samples": 65536
   },
   "dsp": {
-    "channel_lp_hz": 12000,
-    "channel_taps": 255,
+    "channel_lp_hz": 13000,
+    "channel_taps": 511,
     "subcarrier_hz": 9960,
     "sub_lp_hz": 700,
-    "sub_taps": 127,
+    "sub_taps": 255,
     "tone_lp_hz": 100,
     "tone_taps": 127,
     "tone_hz": 30,
     "agc_tau_s": 0.5,
-    "integration_s": 1.0,
+    "integration_s": 2.0,
     "hop_s": 1.0,
     "noise_bins_hz": [
       25.0,
@@ -50,7 +58,10 @@
       33.0,
       35.0
     ],
-    "_note": "intermediate 32 kHz, demod 4 kHz, output 1 kHz -- see amendment A9"
+    "_note": "intermediate 32 kHz, demod 4 kHz, output 1 kHz (A9); channel 13 kHz/511 taps and sub 255 taps (A25); 2 s windows at 1 s hop (A25)",
+    "afc_threshold_hz": 300.0,
+    "afc_tau_s": 1.0,
+    "fm_estimator": "discriminator"
   },
   "bearing": {
     "phase_sign": 1,

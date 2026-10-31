@@ -19,6 +19,7 @@ calibration constants are either both present or both null.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,14 @@ from rbvor.dsp import INTERMEDIATE_HZ, DspParams
 from rbvor.quality import QualityParams
 
 __all__ = ["Config", "ConfigError", "load", "DEFAULT_PATHS", "SCHEMA_PATH"]
+
+log = logging.getLogger("rbvor.config")
+
+#: `publish` keys that stopped meaning anything with RB-VOR-IF v2.0 (A20):
+#: transmit-on-change is the only policy and there is no synthetic score on
+#: the wire. Still accepted so a pre-v2.0 config loads; warned about so it
+#: gets cleaned up.
+DEPRECATED_PUBLISH_KEYS = ("mode", "period_s", "deadband_deg", "signal_scale")
 
 _ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = _ROOT / "schema" / "rb-vor.schema.json"
@@ -67,6 +76,10 @@ class Config:
             tone_taps=d["tone_taps"], tone_hz=d["tone_hz"],
             agc_tau_s=d["agc_tau_s"], integration_s=d["integration_s"],
             hop_s=d["hop_s"], noise_bins_hz=tuple(d["noise_bins_hz"]),
+            # optional since A25; DspParams holds the defaults so an older
+            # config (the field one, for instance) keeps loading
+            **{k: d[k] for k in ("afc_threshold_hz", "afc_tau_s", "fm_estimator",
+                                 "fm_beta", "sub_search_hz") if k in d},
         )
 
     @property
@@ -152,9 +165,6 @@ def _validate_relationships(d: dict) -> None:
         _fail("['sdr']['tuner_offset_hz']",
               "must be inside +/- fs/2, otherwise the carrier falls outside the "
               "sampled band")
-    if sdr["tuner_offset_hz"] != -sdr["sample_rate_hz"] // 4:
-        # Not an error: legal, just slower. Amendment A1.
-        pass
 
     if dsp["subcarrier_hz"] + dsp["sub_lp_hz"] > INTERMEDIATE_HZ / 2:
         _fail("['dsp']['sub_lp_hz']",
@@ -174,12 +184,13 @@ def _validate_relationships(d: dict) -> None:
         _fail("['frequency']['denylist_mhz']",
               f"channels appear in both allowlist and denylist: {sorted(overlap)}")
 
-    if pub["mode"] == "on_change" and pub["keepalive_s"] <= pub["period_s"]:
-        # Doc A section 10.3: on_change without a keep-alive is forbidden, because
-        # a consumer could not distinguish "steady" from "dead".
-        _fail("['publish']['keepalive_s']",
-              "on_change mode requires a keep-alive longer than period_s, so a "
-              "consumer can distinguish a steady bearing from a dead daemon")
+    # Doc A section 10.3 forbade on_change without a keep-alive. Since RB-VOR-IF
+    # v2.0 (A20) on-change is the only policy and the spec allows keepalive_s = 0,
+    # placing the staleness timeout on the consumer (spec section 4, item 2).
+    stale = [k for k in DEPRECATED_PUBLISH_KEYS if k in pub]
+    if stale:
+        log.warning("config['publish']: %s no longer do anything since RB-VOR-IF "
+                    "v2.0 and can be removed", ", ".join(stale))
 
     b = d["bearing"]
     have = (b["phase_sign"] is not None, b["phase_offset_deg"] is not None)

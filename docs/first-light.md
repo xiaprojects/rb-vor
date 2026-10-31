@@ -22,9 +22,9 @@ Fill one block per capture. A capture without this context is not evidence.
 
 ## Log
 
-| Date | Site | Station | Freq | Expected radial | Decoded | Error | vorsignal | Notes |
+| Date | Site | Station | Freq | Expected radial | Decoded | Error | vorstatus | Notes |
 |---|---|---|---|---|---|---|---|---|
-| | | | | | | | | |
+| 2026-09-27 | airborne nr LIRZ, 9.3–11.6 nm, 724–2493 ft | assumed PRU (43.0959/12.5132, unverified) | 109.400 | 241°→273° true (≈237°–269° mag) | **none** | — | 1 (NO_SIGNAL) for 14 min | First flight log: `flightlog-20260927175640.0159.sqlite`. AM depth 0.005 vs 0.30 nominal, SNR 2.6 dB, flat on the ground and airborne → noise floor, no signal. Receiver behaved correctly (no bearing published). See CLAUDE.md F6. |
 
 ## Bench notes — car test
 

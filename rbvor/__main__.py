@@ -79,6 +79,8 @@ async def _run(cfg, args) -> int:
                                 max_seconds=cfg.record["max_seconds"],
                                 fmt=cfg.record["format"])
 
+    # 1.0.0: raw per-window decode dump (--csv), the live counterpart of what
+    # vor_replay.py writes off a capture, with the tuned channel per row.
     obs_sink = None
     if args.csv:
         from rbvor.obscsv import ObsCsvSink
@@ -93,13 +95,44 @@ async def _run(cfg, args) -> int:
     if not cfg.calibrated:
         log.warning("bearing calibration is not set: NO bearing will be published. "
                     "Run tools/vor_calibrate.py (amendment A2, open item O1).")
+    if cfg.sdr["tuner_offset_hz"] == 0:
+        log.warning("sdr.tuner_offset_hz is 0: the carrier sits on the tuner's DC "
+                    "spur. Expect diluted AM depth and low SNR (CLAUDE.md F2); "
+                    "use -fs/4 (amendment A1).")
+    if cfg.sdr.get("swap_iq"):
+        log.warning("sdr.swap_iq is set: a standard RTL-SDR does not need it since "
+                    "amendment A22 (the old 'mirror' was our own sign convention). "
+                    "Confirm with `vor_replay.py --survey` on a capture from this "
+                    "dongle, or the band will now be mirrored the other way.")
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
-    tasks = []
+    # A task that dies takes the daemon down with it. Found in the field (F3):
+    # with no openable SDR, `tick()` raised SdrError inside the ticker task, the
+    # exception was never awaited, and the process idled headless for ten
+    # minutes reporting `blocks_read: 0`. Under systemd the watchdog would have
+    # masked it; on a bench nothing recovers. So every task is watched, the
+    # first failure stops the loop, and it is re-raised after cleanup so
+    # `main()` can turn it into an exit code.
+    tasks: list[asyncio.Task] = []
+    failures: list[BaseException] = []
+
+    def _watch(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        e = t.exception()
+        if e is not None:
+            log.error("%s task failed: %s", t.get_name(), e)
+            failures.append(e)
+            stop.set()
+
+    def spawn(coro, name: str) -> None:
+        t = asyncio.create_task(coro, name=name)
+        t.add_done_callback(_watch)
+        tasks.append(t)
     # The bridge client is only started when the channel actually comes from the
     # bridge. Bench mode (--freq) and replay both supply the channel themselves,
     # so starting the client would only flood the log with connection-refused
@@ -116,7 +149,7 @@ async def _run(cfg, args) -> int:
                               on_connect=controller.on_bridge_connected,
                               on_disconnect=controller.on_bridge_disconnected,
                               on_gps_track=_set_track)
-        tasks.append(asyncio.create_task(client.run()))
+        spawn(client.run(), "bridge")
 
     sd.ready(f"config {cfg.source}")
 
@@ -149,8 +182,11 @@ async def _run(cfg, args) -> int:
             s = sdr.stats
             sdr_bit = (f" | sdr blk {s['blocks_read']} ovr {s['overruns']} "
                        f"err {s['read_errors']} q {s['queued']}")
+        o = getattr(c, "_last_obs", None)
+        afc = (f"  afc {o.carrier_offset_hz:+.0f} Hz"
+               if o is not None and abs(o.carrier_offset_hz) >= 50 else "")
         return (f"[{c.state:11s}] {ch} MHz  brg {bearing}  sig {vs:3d}  "
-                f"{qterms}{sdr_bit}")
+                f"{qterms}{afc}{sdr_bit}")
 
     async def ticker() -> None:
         last = ""
@@ -169,7 +205,7 @@ async def _run(cfg, args) -> int:
                 last_status_print = now
             await asyncio.sleep(0.1)
 
-    tasks.append(asyncio.create_task(ticker()))
+    spawn(ticker(), "ticker")
 
     if live:
         async def pump() -> None:
@@ -183,12 +219,17 @@ async def _run(cfg, args) -> int:
                     log.info("sdr %s", sdr.stats)
                     last_report = loop.time()
                 await asyncio.sleep(0.0 if got else 0.02)
-        tasks.append(asyncio.create_task(pump()))
+        spawn(pump(), "pump")
     else:
         async def replay() -> None:
             from rbvor.record import iq_blocks, read_sidecar
             meta = read_sidecar(args.replay)
             swap = bool(cfg.sdr.get("swap_iq", False))
+            if (meta.synthetic is not None and "carrier_at" not in meta.synthetic
+                    and not swap):
+                log.warning("%s was generated before amendment A22 and has the "
+                            "carrier on the wrong side of centre; set sdr.swap_iq "
+                            "for this file or regenerate it", args.replay)
             if args.freq is None:
                 controller.set_channel(meta.nav_freq_hz / 1e6)
             for _ in range(12):
@@ -200,7 +241,7 @@ async def _run(cfg, args) -> int:
                 await asyncio.sleep(0)
             await asyncio.sleep(0.5)
             stop.set()
-        tasks.append(asyncio.create_task(replay()))
+        spawn(replay(), "replay")
 
     try:
         await stop.wait()
@@ -208,6 +249,7 @@ async def _run(cfg, args) -> int:
         sd.stopping()
         for t in tasks:
             t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         if live:
             sdr.close()
             log.info("sdr final %s", sdr.stats)
@@ -215,11 +257,15 @@ async def _run(cfg, args) -> int:
         if obs_sink is not None:
             obs_sink.close()
             log.info("wrote %d rows to %s", obs_sink.rows, args.csv)
+        if recorder is not None:
+            recorder.flush(timeout=10.0)     # let a capture in flight finish its sidecar
         if isinstance(transport, HttpTransport):
             await transport.close()
         if isinstance(transport, RecordingTransport):
             log.info("dry run: %d payloads, last %s",
                      len(transport.sent), transport.sent[-1] if transport.sent else None)
+    if failures:
+        raise failures[0]
     return 0
 
 
@@ -235,13 +281,13 @@ def main(argv=None) -> int:
                     help="log payloads instead of POSTing them")
     ap.add_argument("--self-test", action="store_true",
                     help="run the full chain on a synthetic signal and exit")
-    ap.add_argument("--log-level", default=None)
-    ap.add_argument("--status-every", type=float, default=2.0,
-                    help="seconds between the one-line status dashboard (default 2)")
     ap.add_argument("--csv", type=Path, default=None,
                     help="dump every decoded window to this CSV file "
                          "(t,frequency,delta_phi_deg,phi_a_deg,phi_b_deg,amp_a,"
                          "amp_b,sub_level,carrier,noise_est,snr_db,overrun)")
+    ap.add_argument("--log-level", default=None)
+    ap.add_argument("--status-every", type=float, default=2.0,
+                    help="seconds between the one-line status dashboard (default 2)")
     ap.add_argument("--quiet", action="store_true",
                     help="suppress the periodic status dashboard")
     ap.add_argument("--version", action="version", version=f"rb-vor {__version__}")

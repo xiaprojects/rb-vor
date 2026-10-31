@@ -195,7 +195,7 @@ python3 -m rbvor --config /etc/rb-vor/rb-vor.json --replay /tmp/bench.cu8
 The mock bridge prints and validates every payload:
 
 ```
-  [rest] {"vordir": 137, "vorsignal": 99}
+  [rest] {"vorradial": 137, "vorsnr": 41, "voram": 29, "vorstatus": 5, "vorsub": 25, "vorfreqactive": 109400}
 ```
 
 Any deviation from the interface spec is flagged inline with the reason.
@@ -230,7 +230,8 @@ Let it run 10 minutes and check the periodic `sdr` line:
 | `read_errors` | 0 | USB or power; try a powered hub, shorter lead |
 | `queued` | small and steady | fine |
 
-**`vorsignal` stuck at 0 with rising `overruns`** is the one failure with a
+**`sig 0` on the status line (`vorsnr`/`voram` 0 on the wire) with rising
+`overruns`** is the one failure with a
 misleading symptom. The reader is outrunning the demodulator, so every
 integration window touches a sample gap and is discarded — correctly, since a
 window spanning a discontinuity would give a wrong bearing. Availability is

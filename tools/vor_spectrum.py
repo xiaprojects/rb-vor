@@ -73,7 +73,8 @@ def analyse(path: Path, seconds: float = 4.0) -> dict:
     z = np.concatenate(chunks)[:want]
 
     # Where is the carrier, really? Do not trust the sidecar offset blindly --
-    # a ppm error or a wrong --offset shows up here and nowhere else.
+    # a ppm error or a wrong --offset shows up here and nowhere else. A tuner
+    # parked at nav + offset puts the navaid at -offset in baseband (A22).
     nfft = min(1 << 16, 1 << int(np.floor(np.log2(z.size))))
     spec = np.fft.fftshift(np.abs(np.fft.fft(z[:nfft])))
     faxis = np.fft.fftshift(np.fft.fftfreq(nfft, 1.0 / fs))
@@ -93,8 +94,12 @@ def analyse(path: Path, seconds: float = 4.0) -> dict:
         "seconds": z.size / fs,
         "nav_freq_mhz": meta.nav_freq_hz / 1e6,
         "sidecar_offset_hz": meta.tuner_offset_hz,
+        "expected_carrier_hz": -meta.tuner_offset_hz,
         "measured_offset_hz": f_peak,
-        "offset_error_hz": f_peak - meta.tuner_offset_hz,
+        "offset_error_hz": f_peak - (-meta.tuner_offset_hz),
+        # closer to +offset (the mirror) than to -offset (where it belongs)
+        "mirrored": bool(meta.tuner_offset_hz) and (
+            abs(f_peak - meta.tuner_offset_hz) < abs(f_peak + meta.tuner_offset_hz)),
         "carrier_level": carrier,
         # Band measurements, not bin measurements -- see amendment A7.
         "am30_depth": band_amp(audio, fs, 20, 40) / carrier,
@@ -123,9 +128,13 @@ def report(d: dict) -> str:
     if d["station"] or d["site"]:
         L.append(f"context       {d['station']} @ {d['site']} {d['notes']}")
     L.append(f"nav freq      {d['nav_freq_mhz']:.3f} MHz")
-    L.append(f"tuner offset  sidecar {d['sidecar_offset_hz']/1e3:+.1f} kHz, "
+    L.append(f"tuner offset  sidecar {d['sidecar_offset_hz']/1e3:+.1f} kHz, so the "
+             f"carrier is expected at {d['expected_carrier_hz']/1e3:+.1f} kHz; "
              f"measured {d['measured_offset_hz']/1e3:+.3f} kHz "
              f"(error {d['offset_error_hz']:+.1f} Hz)")
+    if d["mirrored"]:
+        L.append("    ^ the carrier is on the MIRROR side of centre -- see "
+                 "vor_replay.py --survey (A22)")
     L.append("")
     L.append("  component            depth    nominal   verdict")
     for key, label, nom in (("am30_depth", "30 Hz AM", 0.30),

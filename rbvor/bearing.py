@@ -41,7 +41,7 @@ def wrap360(deg: float) -> float:
 
     `x % 360.0` on a tiny negative value returns exactly 360.0 in float, because
     360.0 - 1e-15 is not representable. That would put a bearing outside the
-    0-359 range declared by RB-VOR-IF v1.0 -- and `circular_mean([359, 1])`,
+    0-359 range declared by RB-VOR-IF (every version) -- and `circular_mean([359, 1])`,
     which must be 0, produces exactly that tiny negative angle.
     """
     v = float(deg) % 360.0
@@ -58,7 +58,7 @@ def angular_difference(a: float, b: float) -> float:
 
 
 def to_int_bearing(deg: float) -> int:
-    """Round to the integer bearing published by RB-VOR-IF v1.0, 0..359.
+    """Round to the integer bearing published as `vorradial`, 0..359.
 
     Two traps, both caught by tests:
       * round(359.7) is 360, which is outside the declared range;
@@ -163,7 +163,14 @@ class BearingTracker:
         raw = radial(delta_phi_rad, self.cal)
         self._smooth.append(raw)
         self._hist.append(raw)
-        return circular_mean(list(self._smooth))
+        try:
+            return circular_mean(list(self._smooth))
+        except ValueError:
+            # The smoothing window cancelled out exactly (e.g. 0 and 180 with
+            # smooth_n = 2). A ValueError here would propagate out of
+            # Controller.push() and kill the sample pump (F3). The newest raw
+            # value is the honest answer; q_stab will flag the dispersion.
+            return raw
 
     @property
     def raw(self) -> float | None:

@@ -37,7 +37,8 @@ from tools.vor_gen import VorParams, generate_blocks  # noqa: E402
 
 
 def run_one(radial, snr_db, cal, qp, fs=256_000, seconds=10.0, skip=2,
-            vor_type="cvor", seed=0, ident="", warm=4):
+            vor_type="cvor", seed=0, ident="", warm=4, integration_s=1.0,
+            fm_estimator="discriminator"):
     """One sweep point.
 
     Warm-up is handled in two stages and both matter:
@@ -50,7 +51,8 @@ def run_one(radial, snr_db, cal, qp, fs=256_000, seconds=10.0, skip=2,
     p = VorParams(radial_deg=radial, vor_type=vor_type, fs=fs, seconds=seconds,
                   offset_hz=-fs // 4, snr_db=snr_db, ident=ident,
                   seed=seed, block=1 << 16)
-    d = VorDemod(DspParams(fs=fs, offset_hz=-fs // 4))
+    d = VorDemod(DspParams(fs=fs, offset_hz=-fs // 4, integration_s=integration_s,
+                           fm_estimator=fm_estimator))
     all_obs = []
     for blk in generate_blocks(p):
         all_obs += d.push(blk)
@@ -61,7 +63,10 @@ def run_one(radial, snr_db, cal, qp, fs=256_000, seconds=10.0, skip=2,
     rows = []
     for o in usable:
         b = tracker.update(o.delta_phi)
-        rows.append((o, b, q.update(o, b)))
+        # A15: quality judges the RAW bearing; the smoothed one is published.
+        # This tool fed it the smoothed value until 2026-09-12 and therefore
+        # over-read q_stab, exactly the bug A15 fixed in the controller.
+        rows.append((o, b, q.update(o, tracker.raw)))
     rows = rows[warm:]
     if not rows:
         return None
@@ -85,7 +90,12 @@ def main(argv=None) -> int:
     ap.add_argument("--snr", type=float, nargs="+",
                     default=[40, 30, 20, 15, 10, 6, 3])
     ap.add_argument("--fs", type=int, default=256_000)
-    ap.add_argument("--seconds", type=float, default=6.0)
+    ap.add_argument("--seconds", type=float, default=12.0,
+                    help="signal per point; must leave >= 6 windows after warm-up")
+    ap.add_argument("--integration", type=float, default=2.0,
+                    help="window length, s (the shipped config uses 2.0, A25)")
+    ap.add_argument("--fm-estimator", choices=("discriminator", "harmonic"),
+                    default="discriminator", help="reference-tone estimator (D7)")
     ap.add_argument("--sign", type=int, default=None)
     ap.add_argument("--offset", type=float, default=None)
     ap.add_argument("--md", type=Path, default=None)
@@ -95,7 +105,7 @@ def main(argv=None) -> int:
     if a.sign is None or a.offset is None:
         from tools.vor_calibrate import solve
         print("no calibration supplied; measuring it first\n")
-        cal_result = solve(a.fs, a.seconds, verbose=False)
+        cal_result = solve(a.fs, a.seconds, verbose=False, fm_estimator=a.fm_estimator)
         sign = a.sign if a.sign is not None else cal_result["phase_sign"]
         offset = a.offset if a.offset is not None else cal_result["phase_offset_deg"]
         print(f"using phase_sign {sign:+d}, phase_offset_deg {offset:+.4f}\n")
@@ -110,7 +120,8 @@ def main(argv=None) -> int:
     total = len(radials) * len(a.snr)
     for i, snr in enumerate(a.snr):
         for j, r in enumerate(radials):
-            res = run_one(r, snr, cal, qp, fs=a.fs, seconds=a.seconds)
+            res = run_one(r, snr, cal, qp, fs=a.fs, seconds=a.seconds,
+                          integration_s=a.integration, fm_estimator=a.fm_estimator)
             if res:
                 rows.append(res)
             n = i * len(radials) + j + 1
@@ -127,7 +138,9 @@ def main(argv=None) -> int:
     lines = []
     lines.append("# RB-VOR accuracy sweep\n")
     lines.append(f"{len(radials)} radials (step {a.step} deg) x {len(a.snr)} SNRs, "
-                 f"fs {a.fs/1000:g} kHz, {a.seconds:g} s per point.\n")
+                 f"fs {a.fs/1000:g} kHz, {a.seconds:g} s per point, "
+                 f"{a.integration:g} s windows at 1 s hop, "
+                 f"`fm_estimator` {a.fm_estimator}.\n")
     lines.append(f"Calibration: `phase_sign` {sign:+d}, "
                  f"`phase_offset_deg` {offset:+.4f}.\n")
     lines.append("| SNR dB | RMS err | max err | vorsignal | q_am | q_sub | q_snr "

@@ -30,17 +30,159 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 import numpy as np
 
-__all__ = ["SdrReader", "SdrError", "FakeDevice"]
+from rbvor.record import to_complex64
+
+__all__ = ["SdrReader", "SdrError", "FakeDevice", "resolve_device",
+           "DeviceChoice", "rtl_serials", "snap_gain", "TUNER_NAMES",
+           "apply_tuner_profile", "TUNER_PROFILE_KEYS"]
 
 log = logging.getLogger("rbvor.sdr")
 
 
 class SdrError(RuntimeError):
     """Device could not be opened, configured or read."""
+
+
+@dataclass(frozen=True)
+class DeviceChoice:
+    """Which dongle to open, and how it was decided."""
+
+    index: int
+    serial: str = ""
+    detail: str = ""
+    warning: str = ""
+
+
+def resolve_device(cfg_sdr: dict, serials: Sequence[str]) -> DeviceChoice:
+    """Pick the dongle from `sdr.device_serial` / `sdr.device_index` (A27).
+
+    `serials` is the librtlsdr enumeration, position == device index; an entry
+    may be "" when the USB strings cannot be read. Pure, so the whole policy is
+    testable without a radio -- which matters here, because `rtlsdr` cannot even
+    be imported on a machine whose librtlsdr lacks the blog fork's symbols.
+
+    Rules, in order:
+
+    1. `device_serial` set -> that dongle, or an error naming what IS present.
+       A wrong serial must never silently fall back to index 0: pinning the
+       dongle is the entire point, and the failure it exists to prevent
+       (decoding a 1090 MHz antenna, F6) is invisible in the output.
+    2. otherwise `device_index`, bounds-checked against the enumeration.
+    3. more than one dongle and no serial given -> a warning, because index
+       order follows USB enumeration and changes between boots.
+    """
+    want = str(cfg_sdr.get("device_serial", "") or "").strip()
+    n = len(serials)
+    if want:
+        matches = [i for i, s in enumerate(serials) if s == want]
+        if not matches:
+            have = ", ".join(f"{i}:{s or '<no serial>'}" for i, s in enumerate(serials))
+            raise SdrError(
+                f"no RTL-SDR with serial {want!r} (sdr.device_serial); "
+                f"{n} device(s) present: {have or 'none'}. "
+                "Set serials once with `rtl_eeprom -d <n> -s <name>`.")
+        if len(matches) > 1:
+            raise SdrError(f"{len(matches)} RTL-SDRs share serial {want!r}: "
+                           "give them distinct serials with `rtl_eeprom -s`")
+        i = matches[0]
+        return DeviceChoice(i, want, f"serial {want!r} (index {i})")
+
+    idx = int(cfg_sdr.get("device_index", 0) or 0)
+    if n and not 0 <= idx < n:
+        raise SdrError(f"sdr.device_index {idx} but {n} RTL-SDR device(s) present "
+                       f"(valid 0..{n - 1})")
+    serial = serials[idx] if idx < n else ""
+    warning = ""
+    if n > 1:
+        warning = (f"{n} RTL-SDR devices present and sdr.device_serial is unset: "
+                   f"using index {idx} (serial {serial or '<no serial>'}). USB "
+                   "enumeration order is not stable -- pin the VOR dongle by "
+                   "serial, or a reboot can point the receiver at the ADS-B "
+                   "antenna (CLAUDE.md F6).")
+    return DeviceChoice(idx, serial, f"index {idx}"
+                        + (f" (serial {serial})" if serial else ""), warning)
+
+
+#: librtlsdr's `enum rtlsdr_tuner`. Worth logging: the tuner decides the gain
+#: ladder AND the spectral sense (A28), and this project's conventions were
+#: all measured on an R820T.
+TUNER_NAMES = {0: "unknown", 1: "E4000", 2: "FC0012", 3: "FC0013",
+               4: "FC2580", 5: "R820T", 6: "R828D"}
+
+
+#: Settings a `sdr.tuner_profiles` entry may override once the tuner is known.
+#: Deliberately short: these are the three that are properties of the *tuner*
+#: rather than of the installation (A28).
+TUNER_PROFILE_KEYS = ("swap_iq", "gain_db", "ppm")
+
+
+def apply_tuner_profile(cfg_sdr: dict, tuner: str) -> tuple[dict, list[str]]:
+    """Overlay `sdr.tuner_profiles[<tuner>]` on the sdr config (A28).
+
+    Returns `(effective, notes)`. The tuner is only known after the device is
+    open, so this runs late and the base `sdr` values stay the fallback -- a
+    config with no profiles behaves exactly as before.
+
+    It exists because the two tuners in this aircraft disagree about things the
+    decoder must get right and cannot guess: the FC0012 has five gain steps to
+    19.2 dB where an R820T has 29 to 49.6, and the two families may deliver
+    opposite spectral senses (librtlsdr runs the R820T in low-IF with spectrum
+    inversion; the FC0012 is zero-IF -- O21). One config file then serves
+    either dongle, and swapping hardware needs no edit.
+    """
+    prof = (cfg_sdr.get("tuner_profiles") or {}).get(tuner or "", {}) or {}
+    effective = dict(cfg_sdr)
+    notes: list[str] = []
+    for k in TUNER_PROFILE_KEYS:
+        if k in prof and prof[k] != cfg_sdr.get(k):
+            notes.append(f"{k}: {cfg_sdr.get(k)!r} -> {prof[k]!r}")
+            effective[k] = prof[k]
+    return effective, notes
+
+
+def snap_gain(requested_db: float, supported_db: Sequence[float]) -> tuple[float, str]:
+    """Snap a requested gain to the tuner's own ladder (A28).
+
+    Returns `(chosen, note)`; `note` is "" when the request was already a step.
+
+    Every tuner quantises to a different set: the R820T2 has 29 steps to
+    49.6 dB, the **FC0012 has five, topping out at 19.2 dB**. librtlsdr rounds
+    silently, so a config asking for 32.8 dB on an FC0012 gets 19.2 and says
+    nothing -- the number in the file then describes neither the request nor
+    the hardware. We snap explicitly and say so.
+    """
+    if not supported_db:
+        return float(requested_db), ""
+    chosen = min(supported_db, key=lambda g: (abs(g - requested_db), g))
+    if abs(chosen - requested_db) < 0.05:
+        return float(chosen), ""
+    lo, hi = min(supported_db), max(supported_db)
+    if requested_db > hi:
+        note = (f"gain {requested_db:g} dB is above this tuner's maximum; "
+                f"using {chosen:g} dB (ladder {lo:g}..{hi:g} dB)")
+    elif requested_db < lo:
+        note = (f"gain {requested_db:g} dB is below this tuner's minimum; "
+                f"using {chosen:g} dB (ladder {lo:g}..{hi:g} dB)")
+    else:
+        note = (f"gain {requested_db:g} dB is not a step of this tuner; "
+                f"using {chosen:g} dB")
+    return float(chosen), note
+
+
+def rtl_serials() -> list[str]:
+    """Serial of every RTL-SDR present, position == device index. [] if unknown."""
+    try:
+        from rtlsdr import RtlSdr
+        return [s if isinstance(s, str) else s.decode("ascii", "replace")
+                for s in RtlSdr.get_device_serial_addresses()]
+    except Exception as e:                           # noqa: BLE001
+        log.debug("cannot enumerate RTL-SDR devices: %s", e)
+        return []
 
 
 class FakeDevice:
@@ -73,6 +215,14 @@ class _SoapyDevice:
         self._S = SoapySDR
         self._RX = SOAPY_SDR_RX
         args = cfg["device_args"] or "driver=rtlsdr"
+        # A27: pin the dongle. SoapySDR's rtlsdr driver takes `serial=` or
+        # `rtl=<index>`; only add them when the operator has not already put an
+        # explicit selector in device_args.
+        sel = str(cfg.get("device_serial", "") or "").strip()
+        if sel and "serial=" not in args:
+            args = f"{args},serial={sel}"
+        elif not sel and "rtl=" not in args and "serial=" not in args:
+            args = f"{args},rtl={int(cfg.get('device_index', 0) or 0)}"
         try:
             self.dev = SoapySDR.Device(args)
             self.dev.setSampleRate(SOAPY_SDR_RX, 0, cfg["sample_rate_hz"])
@@ -113,25 +263,59 @@ class _PyRtlDevice:
             from rtlsdr import RtlSdr
         except ImportError as e:
             raise SdrError("pyrtlsdr is not installed") from e
-        try:
-            self.dev = RtlSdr()
-            self.dev.sample_rate = cfg["sample_rate_hz"]
-            self.dev.gain = "auto" if cfg["gain_mode"] == "agc" else cfg["gain_db"]
-            if cfg["ppm"]:
-                self.dev.freq_correction = cfg["ppm"]
         except Exception as e:                       # noqa: BLE001
-            raise SdrError(f"pyrtlsdr: {e}") from e
-        self.name = "pyrtlsdr"
+            # `rtlsdr` binds librtlsdr at IMPORT time, so a version mismatch
+            # raises AttributeError (e.g. `undefined symbol:
+            # rtlsdr_set_dithering` against a stock librtlsdr where pyrtlsdr
+            # expects the rtl-sdr-blog fork, O7). That is not an ImportError,
+            # so it used to escape as a raw ctypes error and take the daemon
+            # down with a message naming neither the cause nor the fix.
+            raise SdrError(
+                f"pyrtlsdr cannot bind librtlsdr ({e}). The installed "
+                "librtlsdr does not match pyrtlsdr's expectations -- see "
+                "RUN.md section 7 (RTL-SDR Blog fork)."
+            ) from e
+        choice = resolve_device(cfg, rtl_serials())
+        if choice.warning:
+            log.warning("%s", choice.warning)
+        tuner = ""
+        try:
+            self.dev = RtlSdr(device_index=choice.index)
+            self.dev.sample_rate = cfg["sample_rate_hz"]
+            with contextlib.suppress(Exception):
+                tuner = TUNER_NAMES.get(self.dev.get_tuner_type(), "unknown")
+            eff, notes = apply_tuner_profile(cfg, tuner)
+            for n in notes:
+                log.info("tuner profile %s: %s", tuner, n)
+            if eff["gain_mode"] == "agc":
+                self.dev.gain = "auto"
+            else:
+                # A28: snap to the tuner's ladder and say so. The aircraft's VOR
+                # dongle is an FC0012 (five steps, max 19.2 dB), not the R820T2
+                # the config's numbers came from.
+                gain, note = snap_gain(eff["gain_db"],
+                                       getattr(self.dev, "valid_gains_db", []) or [])
+                if note:
+                    log.warning("%s: %s", tuner or "tuner", note)
+                self.dev.gain = gain
+            if eff["ppm"]:
+                self.dev.freq_correction = eff["ppm"]
+        except SdrError:
+            raise
+        except Exception as e:                       # noqa: BLE001
+            raise SdrError(f"pyrtlsdr {choice.detail}: {e}") from e
+        self.tuner = tuner
+        self.name = f"pyrtlsdr {choice.detail}" + (f", {tuner} tuner" if tuner else "")
         self.closed = False
 
     def set_frequency(self, hz: int) -> None:
         self.dev.center_freq = int(hz)
 
     def read(self, n: int) -> np.ndarray:
+        # librtlsdr delivers cu8 (A4); one conversion path shared with replay,
+        # so the live stream and a capture file decode byte-identically.
         raw = np.frombuffer(self.dev.read_bytes(n * 2), dtype=np.uint8)
-        lut = (np.arange(256, dtype=np.float32) - 127.5) / 127.5
-        v = lut[raw]
-        return (v[0::2] + 1j * v[1::2]).astype(np.complex64)
+        return to_complex64(raw, "cu8")
 
     def close(self) -> None:
         if not self.closed:
@@ -183,10 +367,13 @@ class SdrReader:
         self.device = device
         self.block_samples = cfg_sdr["block_samples"]
         self.offset_hz = cfg_sdr["tuner_offset_hz"]
-        # Some RTL-SDR setups deliver a spectrally-mirrored band, putting the
-        # signal on the wrong side of centre. Conjugating each block un-mirrors
-        # it. Off by default; set sdr.swap_iq true when the survey reports a
-        # MIRROR. Applied here, so it covers every backend uniformly.
+        # Per-dongle override: conjugate each block to un-mirror a genuinely
+        # inverted device or an I/Q-swapped capture path. A standard RTL-SDR
+        # does NOT need it (amendment A22 -- the "mirror" every real capture
+        # showed was our own sign convention, since corrected). Off by
+        # default; set it only when `vor_replay.py --survey` reports a MIRROR
+        # on a capture from THIS dongle. Applied here so it covers every
+        # backend uniformly.
         self.swap_iq = bool(cfg_sdr.get("swap_iq", False))
         self._q: queue.Queue = queue.Queue(maxsize=cfg_sdr["buffer_blocks"])
         self._thread: threading.Thread | None = None
@@ -203,6 +390,17 @@ class SdrReader:
         if self.device is None:
             self.device = open_device(self.cfg)
         log.info("SDR open: %s", getattr(self.device, "name", "unknown"))
+        # A28: `swap_iq` is consumed here rather than in the device, and the
+        # tuner is only known once the device is open -- so the profile is
+        # applied last, and loudly, because it changes how the band is read.
+        tuner = getattr(self.device, "tuner", "")
+        if tuner:
+            eff, _ = apply_tuner_profile(self.cfg, tuner)
+            want = bool(eff.get("swap_iq", False))
+            if want != self.swap_iq:
+                log.info("tuner profile %s: swap_iq %s -> %s",
+                         tuner, self.swap_iq, want)
+                self.swap_iq = want
 
     def start(self) -> None:
         if self._thread is not None:
@@ -250,14 +448,25 @@ class SdrReader:
     # -- consumer side ----------------------------------------------------- #
 
     def blocks(self, timeout: float = 0.0):
-        """Yield `(samples, gap)` pairs currently available. Never blocks long."""
-        first = True
-        while True:
+        """Yield the `(samples, gap)` pairs queued at the moment of the call.
+
+        Bounded on purpose. A caller loops `for block in reader.blocks()`, and
+        if the reader thread refills the queue faster than the caller drains
+        it, an unbounded generator never returns: the daemon's pump would sit
+        in that loop for ever, never yielding to the event loop, so the ticker
+        stops, the state machine stops, and the watchdog stops being fed --
+        precisely when the machine is overloaded (F5). Yielding at most what
+        was queued on entry guarantees the caller gets control back at least
+        once per `buffer_blocks`; anything that arrives meanwhile is picked up
+        by the next call, and anything that overflows is counted and flagged
+        (F9) rather than silently delayed.
+        """
+        limit = max(1, self._q.qsize())
+        for i in range(limit):
             try:
-                item = self._q.get(timeout=timeout if first else 0.0)
+                item = self._q.get(timeout=timeout if i == 0 else 0.0)
             except queue.Empty:
                 return
-            first = False
             yield item
 
     def _drain(self) -> None:

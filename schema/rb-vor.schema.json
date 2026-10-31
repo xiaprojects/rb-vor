@@ -75,22 +75,29 @@
           "enum": [
             "periodic",
             "on_change"
-          ]
+          ],
+          "deprecated": true,
+          "description": "ignored since RB-VOR-IF v2.0 (transmit-on-change is the only policy); accepted so older configs still load"
         },
         "period_s": {
           "type": "number",
           "exclusiveMinimum": 0,
-          "maximum": 60
+          "maximum": 60,
+          "deprecated": true,
+          "description": "ignored since RB-VOR-IF v2.0 (transmit-on-change is the only policy); accepted so older configs still load"
         },
         "deadband_deg": {
           "type": "number",
           "minimum": 0,
-          "maximum": 45
+          "maximum": 45,
+          "deprecated": true,
+          "description": "ignored since RB-VOR-IF v2.0 (transmit-on-change is the only policy); accepted so older configs still load"
         },
         "keepalive_s": {
           "type": "number",
-          "exclusiveMinimum": 0,
-          "maximum": 300
+          "minimum": 0,
+          "maximum": 300,
+          "description": "seconds between re-sends of an unchanged payload; 0 disables the keep-alive (RB-VOR-IF v2.x section 3.4)"
         },
         "hold_s": {
           "type": "number",
@@ -102,7 +109,8 @@
             "percent",
             "boolean"
           ],
-          "description": "open item O3 -- confirm against the bridge"
+          "description": "ignored since RB-VOR-IF v2.0 (transmit-on-change is the only policy); accepted so older configs still load",
+          "deprecated": true
         },
         "bearing_ref": {
           "enum": [
@@ -114,12 +122,8 @@
       },
       "required": [
         "bearing_ref",
-        "deadband_deg",
         "hold_s",
-        "keepalive_s",
-        "mode",
-        "period_s",
-        "signal_scale"
+        "keepalive_s"
       ]
     },
     "sdr": {
@@ -186,6 +190,56 @@
           "type": "integer",
           "minimum": 1024,
           "maximum": 1048576
+        },
+        "device_index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 31,
+          "description": "A27: which RTL-SDR to open when several are present (librtlsdr enumeration order). Ignored when device_serial is set; USB order is not stable across boots, so prefer the serial."
+        },
+        "device_serial": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "A27: open the RTL-SDR with this USB serial, whatever its index. Empty = fall back to device_index. Set serials once with `rtl_eeprom -d <n> -s <name>`."
+        },
+        "tuner_profiles": {
+          "type": "object",
+          "description": "A28: per-tuner overrides, applied once the tuner reports itself. The tuner decides the gain ladder and may decide the spectral sense, so one config can serve dongles that disagree. Keys are librtlsdr tuner names; anything absent falls back to the sdr block.",
+          "propertyNames": {
+            "enum": [
+              "E4000",
+              "FC0012",
+              "FC0013",
+              "FC2580",
+              "R820T",
+              "R828D",
+              "unknown"
+            ]
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "swap_iq": {
+                "type": "boolean",
+                "description": "spectral sense for THIS tuner (O21)"
+              },
+              "gain_db": {
+                "type": "number",
+                "minimum": -10,
+                "maximum": 60,
+                "description": "snapped to the tuner's own ladder at open"
+              },
+              "ppm": {
+                "type": "integer",
+                "minimum": -200,
+                "maximum": 200
+              },
+              "_note": {
+                "type": "string"
+              }
+            }
+          }
         }
       },
       "required": [
@@ -274,6 +328,37 @@
         },
         "_note": {
           "type": "string"
+        },
+        "afc_threshold_hz": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 5000,
+          "description": "A25: correct the down-mix once the measured carrier offset exceeds this; 0 disables AFC"
+        },
+        "afc_tau_s": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 30,
+          "description": "A25: smoothing time constant of the carrier-offset estimate"
+        },
+        "fm_estimator": {
+          "enum": [
+            "discriminator",
+            "harmonic"
+          ],
+          "description": "D7: how the 30 Hz reference is recovered from the subcarrier; the calibration constants differ, run vor_calibrate.py --fm-estimator to match"
+        },
+        "fm_beta": {
+          "type": "number",
+          "minimum": 8,
+          "maximum": 24,
+          "description": "D7: nominal deviation ratio (ICAO 16 +/- 1)"
+        },
+        "sub_search_hz": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 500,
+          "description": "D7: +/- range of the subcarrier-offset acquisition (ICAO: 9960 Hz +/- 1 %)"
         }
       },
       "required": [
