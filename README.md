@@ -65,6 +65,34 @@ measured performance and known limitations.
 
 ---
 
+## Example: field test at LIRZ (109.400 MHz)
+
+A drive around the LIRZ VOR with GPS fixes, each decoded radial compared with
+the true radial from the station to the GPS position.
+
+![LIRZ VOR: GPS fixes and decoded radial vectors](captures/LIRZ_VOR_map.png)
+
+Each dot is a GPS fix, the thin grey line is the true radial (VOR → point) and
+the arrow is the decoded radial. Green = locked (scatter < 8°), orange =
+marginal (8–15°), grey = noisy (> 15°). Over the locked fixes the median error
+is **1.5°** and the RMS **2.6°**. Arrows follow the true radials around the
+orbit, and the noisy fixes cluster at the far end of the track.
+
+![Bearing scatter versus distance from the VOR](captures/LIRZ_VOR_quality.png)
+
+Bearing scatter (circular standard deviation) against distance from the VOR,
+coloured by mean SNR. Inside about 1 nm most fixes sit below the 8° lock
+threshold, with a few outliers. Beyond about 1.2 nm scatter rises and most
+fixes are above it.
+
+> The plots were made with their own fit of the calibration
+> (`phase_sign −1`, offset 6.2°), not the values in `config/rb-vor.json`
+> (`phase_sign +1`, `+2.12°`). They are an example of the output, not a
+> validation of the shipped calibration; the GPS-referenced evidence is still
+> tracked as O14 in [`docs/open-items.md`](docs/open-items.md).
+
+---
+
 ## What you need
 
 | # | Item | Primary | Alternate | Note |
