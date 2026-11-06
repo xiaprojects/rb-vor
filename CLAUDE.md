@@ -749,6 +749,26 @@ has no timeout (section 4 item 2 of IF v2.2), and cannot have one yet, because i
 rebroadcasts only changes, so the keep-alive reaches no client. Tracked in
 roastbeef `docs/tech-debt/radio-active-status.md`.
 
+### A32 — CI had never run a test (2026-11-06)
+All five runs since the first push failed at `ruff check .` on the loose
+`test_dongle.py`, so the `pytest` step was skipped every time. The ruff failure
+was hiding two more, each of which would have failed the step on its own:
+
+- Bare `pytest` could not import `rbvor` from `tests/conftest.py`. `python -m
+  pytest` puts the working directory on the path and bare `pytest` does not, so
+  this never showed by hand. `pyproject.toml` now sets `pythonpath = ["."]`.
+  `pip install -e .` would not do: the tests also import `tools.*`, which is not
+  packaged.
+- `ci.yml` kept its own package list, without `websockets` or `aiohttp`. It now
+  installs `requirements.txt`, so the two cannot drift.
+
+`test_dongle.py`'s late `import numpy` keeps a `noqa: E402` instead of moving to
+the top, so the script still reports on the dongle where numpy is missing.
+
+Verified on a replica, not yet on a GitHub runner: Python 3.11.18, a fresh venv
+from `requirements.txt`, a `git archive` of HEAD plus these files, and CI's exact
+commands. Ruff clean, 604 passed, and 604 again pinned to two CPUs.
+
 ---
 
 ## Decisions (continued)

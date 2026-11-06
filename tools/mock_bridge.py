@@ -65,6 +65,12 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
+async def state_handler(request: web.Request) -> web.Response:
+    """Answers the read the daemon makes on connect (CLAUDE.md A31). Nothing to
+    report: unlike RB-01, this socket re-asserts `vorfreq` every period anyway."""
+    return web.json_response({})
+
+
 async def update_handler(request: web.Request) -> web.Response:
     app = request.app
     if app["slow"]:
@@ -117,6 +123,7 @@ def build(args) -> web.Application:
     app["fail_rate"] = args.fail_rate
     app["slow"] = args.slow
     app.router.add_get("/bridge", ws_handler)
+    app.router.add_get("/bridgeUpdate", state_handler)
     app.router.add_post("/bridgeUpdate", update_handler)
     app.router.add_get("/received", dump_handler)
     return app

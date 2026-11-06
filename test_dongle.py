@@ -4,7 +4,8 @@
 Run this on the Pi:  python3 test_dongle.py
 It bypasses rb-vor entirely and just tries to grab 1 second of samples.
 """
-import sys, time
+import sys
+import time
 
 print("1. importing rtlsdr ...", flush=True)
 try:
@@ -36,10 +37,12 @@ try:
     samples = sdr.read_samples(1_024_000)
 except Exception as e:
     print(f"   FAILED to read: {e}")
-    sdr.close(); sys.exit(3)
+    sdr.close()
+    sys.exit(3)
 print(f"   read {len(samples)} samples in {time.time()-t0:.1f}s")
 
-import numpy as np
+import numpy as np  # noqa: E402  -- late on purpose: the dongle verdict must not depend on it
+
 power = np.mean(np.abs(samples)**2)
 print(f"5. mean power: {power:.4f}  (near 0 = no signal/gain; >0.001 = receiving something)")
 sdr.close()

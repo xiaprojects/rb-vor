@@ -8,6 +8,6 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       # No SDR hardware in CI. Every test must be file-driven or synthetic.
-      - run: pip install numpy scipy pytest ruff jsonschema
+      - run: pip install -r requirements.txt
       - run: ruff check .
       - run: pytest
