@@ -1,3 +1,23 @@
+## Unreleased — a shared dongle and a restart are no longer failures (CLAUDE.md A30, A31) — 2026-11-06
+
+- **A dongle that cannot be had no longer stops the daemon.** With the channel
+  from the bridge, being refused the SDR (`usb_claim_interface error -6`, usually
+  because rb-sdr-radio holds it) used to exit 3, and under `Restart=always` the
+  daemon crash-looped for as long as the radio held the dongle, with the plate
+  stuck on TUNING. It now stays up in the new `NO_SDR` state, with the channel
+  still selected and `vorstatus` 1, tries again every `sdr.retry_s` and takes the
+  dongle by itself when it comes free. A dongle missing when the channel is
+  selected behaves the same. One pulled during reception is not covered.
+- **New optional `sdr.retry_s`**, default 5. A config without it still loads.
+- **Bench mode is unchanged:** with `--freq`, nothing will free the dongle, so
+  it is still exit 3 (F3).
+- **The daemon reads the bridge on connect.** The socket says nothing until a value
+  changes, so a restarted daemon could sit OFF with `vorfreq` on the bridge, and
+  pressing that station again changed nothing. It now does a `GET` of
+  `bridge.rest_url` after every connection and returns to that channel. This
+  also ends the case of a bridge lost for longer than `ws_grace_s`.
+- `tools/mock_bridge.py` answers the read.
+
 ## Unreleased — bridge link no longer pings RB-01 (CLAUDE.md A29) — 2026-10-31
 
 - **The WebSocket keepalive ping is off.** RB-01 has no ping/pong, so the

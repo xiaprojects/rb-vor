@@ -680,6 +680,75 @@ keepalive compressed 100× (old: re-made, 2 connections), stop does not wait
 for a close frame (old: 10.0 s), the live socket carries `SO_KEEPALIVE` with
 the configured idle (old: never set).
 
+### A30 — a dongle that cannot be had is a state, not a crash (2026-11-06)
+Found by `test/integration/test_vor_radio.py` in roastbeef, which alternates this
+daemon and rb-sdr-radio on one dongle from the real RB-01 screen. A VOR picked
+while the radio held the dongle made `SdrReader.open()` raise in `_retune`, which
+F3 had made fatal: exit 3, restart after 2 s, exit 3 again, for as long as the
+radio held it, with the plate stuck on TUNING.
+
+F3 stays right about what it fixed, a task that dies silently. What it assumed
+no longer holds: that an unopenable SDR is a broken installation. With one dongle
+shared between two receivers it is normal use, and a pilot action can end it.
+
+Changed: `Controller._tune` catches `SdrError` when `sdr_retry_s` is set and
+enters `State.NO_SDR`. The channel stays selected, `vorstatus` is 1, and the
+dongle is tried again every `sdr.retry_s`, optional, default 5, the same as
+rb-sdr-radio. `_enter` releases the SDR on NO_SDR, because a retune can fail with
+the device already open and waiting must not hold what the other program wants.
+
+Three judgement calls:
+- **`vorstatus` 1, not 2.** TUNING promises it is on the way, and this can last
+  as long as the radio is on. The wire format is unchanged: a consumer reading
+  `vorstatus` needs nothing new. The reason is in the journal and the solution log.
+- **A refused attempt publishes nothing.** Going through TUNING on the wire
+  would flash the plate every 5 s.
+- **Every `SdrError` is retried, not only "busy".** Telling them apart would mean
+  parsing libusb strings through two backends. A dongle missing when a channel
+  is selected recovers the same way once it is plugged in. The cost is that a
+  broken installation now waits at NO_SDR with its reason in the journal, where
+  it used to crash-loop.
+
+**Not covered:** a dongle pulled during reception. `SdrReader._run` still loops on
+read errors with the dead handle, and only a retune reaches `_tune`. Unchanged by
+this amendment and not tested.
+
+**Bench mode is deliberately untouched**: with `--freq` the daemon passes no
+`sdr_retry_s`, the error propagates and F3's exit 3 stands, because nothing will
+free the dongle. So does its regression test.
+
+Verified on a real Nano 3 (R820T, x86), refused by a real rb-sdr-radio. Not run
+on a Pi or an FC0012.
+
+### A31 — the bridge is read on connect (2026-11-06)
+Same test. `/bridge/float/ws` sends nothing on connect, and RB-01 rebroadcasts
+only when a value changes. So a restarted daemon heard `vorfreq` only if something
+on the bridge changed after it connected, and its own startup publish won that
+race by about 2 ms (seen in 1 of 16 runs). A station picked while it was down was
+lost every time. The plate said OFF with `vorfreq` still on the bridge, and pressing
+the same station did nothing, because an unchanged value reaches nobody. rb-sdr-radio
+already had this read, and its tests name this gap.
+
+Changed: after every connection, `BridgeClient` calls `fetch_state`, a `GET` of
+`bridge.rest_url` (`HttpTransport.fetch`), and handles the answer as a frame.
+It is subscribed first, so a change during the GET cannot be missed, and it
+consumes frames only after, so the answer cannot overwrite a newer frame.
+
+**Differs from rb-sdr-radio on purpose:** there a failed read logs a warning and
+keeps the link. Here it is a failed connection, so it reconnects with backoff and
+reads again, because carrying on without the state is the deafness this read
+exists to end. Hence `tools/mock_bridge.py` gained a `GET`.
+
+"Absent" stays "no change", as in a frame: `vorfreq` missing from the answer
+does not idle the daemon. A side effect worth having: after a bridge outage longer
+than `ws_grace_s` the daemon used to stay IDLE until the next change, and now
+returns to the channel.
+
+Known, not addressed: a dead daemon's last `vorstatus` stays on the bridge. RB-01
+has no timeout (section 4 item 2 of IF v2.2), and cannot have one yet, because it
+rebroadcasts only changes, so the keep-alive reaches no client. Tracked in
+roastbeef `docs/tech-debt/radio-active-status.md`.
+
 ---
 
 ## Decisions (continued)
@@ -1026,6 +1095,9 @@ a done-callback; the first failure sets `stop`, is re-raised after cleanup, and
 which hangs to its timeout without the fix. The same review found a second
 way for the pump to die silently — `circular_mean` raising on a smoothing
 window that cancels exactly — closed in `BearingTracker.update`.
+**Narrowed by A30 (2026-11-06):** exit 3 now applies in bench mode only. Under a
+bridge the same error is the `NO_SDR` state, with the dongle retried. The
+done-callback on every task stands: any other task failure still stops the daemon.
 
 ### F5 — the sample pump could starve the event loop under overload (defect, **fixed 2026-09-11**)
 Found by the D5 change, indirectly: after the convention flip the full suite

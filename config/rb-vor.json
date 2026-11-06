@@ -37,6 +37,7 @@
       }
     },
     "settle_ms": 250,
+    "retry_s": 5,
     "buffer_blocks": 16,
     "block_samples": 65536
   },

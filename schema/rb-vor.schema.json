@@ -181,6 +181,13 @@
           "minimum": 0,
           "maximum": 5000
         },
+        "retry_s": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 60,
+          "default": 5,
+          "description": "A30: seconds between attempts on a dongle that cannot be had, usually because rb-sdr-radio holds it. Optional, so a config written before it still loads. Not used in bench mode, where that is exit 3."
+        },
         "buffer_blocks": {
           "type": "integer",
           "minimum": 2,

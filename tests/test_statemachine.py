@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from rbvor.config import Config  # noqa: E402
 from rbvor.controller import DECODING_STATES, Controller, State  # noqa: E402
 from rbvor.dsp import Observation  # noqa: E402
+from rbvor.sdr import SdrError  # noqa: E402
 from tools.vor_gen import VorParams, generate_blocks  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -558,3 +559,160 @@ def test_obs_sink_receives_every_window_with_frequency():
     assert seen, "obs_sink was never called"
     # frequency is the tuned channel in kHz
     assert all(fk == 109_400 for _, fk, _ in seen)
+
+
+# --------------------------------------------------------------------------- #
+# A30 -- the dongle is shared, so being refused it is a state, not a crash
+# --------------------------------------------------------------------------- #
+
+RETRY_S = 5.0
+
+
+class RefusingSdr(FakeSdr):
+    """Refuses the first `refusals` claims, as usb_claim_interface refuses a
+    dongle rb-sdr-radio holds."""
+
+    def __init__(self, refusals):
+        super().__init__()
+        self.refusals = refusals
+        self.attempts = 0
+
+    def set_frequency(self, nav_hz):
+        self.attempts += 1
+        if self.attempts <= self.refusals:
+            raise SdrError("usb_claim_interface error -6")
+        super().set_frequency(nav_hz)
+
+
+def refused(refusals=1000):
+    """A controller under a bridge, on 109.4 and refused the dongle."""
+    c, clock, _, pub = make()
+    c.sdr = RefusingSdr(refusals)
+    c.sdr_retry_s = RETRY_S
+    c.set_channel(109.4)
+    clock.advance(0.5)
+    c.tick()
+    return c, clock, c.sdr, pub
+
+
+def test_a_refused_dongle_is_a_state_and_keeps_the_channel():
+    c, _, sdr, pub = refused()
+    assert c.state is State.NO_SDR
+    assert c.channel_khz == 109400
+    assert "usb_claim_interface" in c.last_reason
+    assert pub.raw[-1]["status"] == 1       # nothing to use, on the wire as NO SIGNAL
+    assert pub.raw[-1]["freq_khz"] == 109400
+    assert pub.raw[-1]["vordir"] is None
+    assert sdr.tuned == []
+
+
+def test_a_refused_dongle_is_tried_again_every_retry_s():
+    c, clock, sdr, _ = refused()
+    assert sdr.attempts == 1
+    clock.advance(RETRY_S - 0.1)
+    c.tick()
+    assert sdr.attempts == 1
+    clock.advance(0.1)
+    c.tick()
+    assert sdr.attempts == 2
+    assert c.state is State.NO_SDR
+    clock.advance(RETRY_S)
+    c.tick()
+    assert sdr.attempts == 3
+
+
+def test_a_refused_attempt_publishes_nothing_new():
+    """No TUNING on the wire per attempt, or the plate flashes every retry_s."""
+    c, clock, _, pub = refused()
+    before = len(pub.raw)
+    for _ in range(4):
+        clock.advance(RETRY_S)
+        c.tick()
+    assert {p["status"] for p in pub.raw[before:]} <= {1}
+
+
+def test_the_dongle_coming_free_needs_no_new_command():
+    c, clock, sdr, pub = refused(refusals=2)
+    clock.advance(RETRY_S)
+    c.tick()
+    assert c.state is State.NO_SDR
+    clock.advance(RETRY_S)
+    c.tick()
+    assert c.state is State.TUNING
+    assert pub.raw[-1]["status"] == 2
+    assert sdr.tuned == [109_400_000]
+    clock.advance(0.5)
+    c.tick()
+    assert c.state is State.ACQUIRING
+
+
+def test_waiting_does_not_hold_the_device():
+    """A retune can fail with the device open. Waiting with it would keep the
+    dongle from the very program this is waiting for."""
+    c, clock, sdr, _ = refused()
+    assert sdr.closed == 1
+    clock.advance(RETRY_S)
+    c.tick()
+    assert sdr.closed == 2
+
+
+def test_off_stops_the_retries():
+    c, clock, sdr, pub = refused()
+    c.set_channel(0.0)
+    assert c.state is State.INVALID_FREQ
+    assert pub.raw[-1]["status"] == 0
+    attempts = sdr.attempts
+    clock.advance(RETRY_S * 3)
+    c.tick()
+    assert sdr.attempts == attempts
+
+
+def test_the_same_frequency_again_does_not_disturb_the_wait():
+    c, clock, sdr, _ = refused()
+    clock.advance(1.0)
+    c.set_channel(109.4)
+    c.tick()
+    assert c._pending is None
+    assert sdr.attempts == 1
+    clock.advance(RETRY_S)
+    c.tick()
+    assert sdr.attempts == 2
+
+
+def test_another_station_while_waiting_is_tried_at_once():
+    c, clock, sdr, pub = refused(refusals=1)
+    c.set_channel(113.8)
+    clock.advance(0.5)
+    c.tick()
+    assert sdr.tuned == [113_800_000]
+    assert c.channel_khz == 113800
+    assert pub.raw[-1]["freq_khz"] == 113800
+
+
+def test_samples_while_waiting_are_dropped():
+    c, *_ = refused()
+    assert State.NO_SDR not in DECODING_STATES
+    assert c.push(np.zeros(4096, dtype=np.complex64)) == 0
+
+
+def test_bridge_loss_ends_the_wait():
+    c, clock, sdr, _ = refused()
+    c.on_bridge_disconnected()
+    clock.advance(c.cfg.bridge["ws_grace_s"] + 0.1)
+    c.tick()
+    assert c.state is State.IDLE
+    attempts = sdr.attempts
+    clock.advance(RETRY_S * 2)
+    c.on_bridge_connected()
+    c.tick()
+    assert sdr.attempts == attempts
+
+
+def test_without_a_retry_period_the_error_still_stops_the_daemon():
+    """Bench mode, F3: nothing will free the dongle, so exit 3 stands."""
+    c, clock, _, _ = make()
+    c.sdr = RefusingSdr(1)
+    c.set_channel(109.4)
+    clock.advance(0.5)
+    with pytest.raises(SdrError):
+        c.tick()

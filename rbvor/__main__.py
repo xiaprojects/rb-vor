@@ -87,10 +87,20 @@ async def _run(cfg, args) -> int:
         obs_sink = ObsCsvSink(args.csv)
         print(f"  dumping per-window decode to {args.csv}", flush=True)
 
+    # The bridge client is only started when the channel actually comes from the
+    # bridge. Bench mode (--freq) and replay both supply the channel themselves,
+    # so starting the client would only flood the log with connection-refused
+    # warnings against a bridge that need not exist. The same test decides what a
+    # dongle that cannot be had means: under a bridge another program may hold it
+    # and the pilot may free it (A30); on a bench nothing will, so it is exit 3 (F3).
+    channel_from_bridge = args.freq is None and args.replay is None
+
     controller = Controller(cfg, sdr, publisher, notify=sd.watchdog,
                             recorder=recorder,
                             solution_sink=sol_logger.write,
-                            obs_sink=obs_sink)
+                            obs_sink=obs_sink,
+                            sdr_retry_s=(cfg.sdr.get("retry_s", 5.0)
+                                         if channel_from_bridge else None))
 
     if not cfg.calibrated:
         log.warning("bearing calibration is not set: NO bearing will be published. "
@@ -133,11 +143,6 @@ async def _run(cfg, args) -> int:
         t = asyncio.create_task(coro, name=name)
         t.add_done_callback(_watch)
         tasks.append(t)
-    # The bridge client is only started when the channel actually comes from the
-    # bridge. Bench mode (--freq) and replay both supply the channel themselves,
-    # so starting the client would only flood the log with connection-refused
-    # warnings against a bridge that need not exist.
-    channel_from_bridge = args.freq is None and args.replay is None
     if args.freq is not None:
         log.info("bench mode: fixed frequency %.3f MHz, bridge input ignored",
                  args.freq)
@@ -148,7 +153,9 @@ async def _run(cfg, args) -> int:
         client = BridgeClient(cfg.bridge, controller.set_channel,
                               on_connect=controller.on_bridge_connected,
                               on_disconnect=controller.on_bridge_disconnected,
-                              on_gps_track=_set_track)
+                              on_gps_track=_set_track,
+                              fetch_state=(transport.fetch if isinstance(
+                                  transport, HttpTransport) else None))
         spawn(client.run(), "bridge")
 
     sd.ready(f"config {cfg.source}")

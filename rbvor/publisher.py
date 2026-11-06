@@ -257,7 +257,7 @@ class Publisher:
 
 
 class HttpTransport:
-    """aiohttp POST, driven from a background event loop.
+    """aiohttp POST, driven from a background event loop, plus the state read.
 
     `send()` is synchronous by contract because the controller is synchronous.
     The coroutine is handed to the running loop and not awaited: the DSP thread
@@ -283,6 +283,15 @@ class HttpTransport:
         if self._session is not None:
             await self._session.close()
             self._session = None
+
+    async def fetch(self) -> str:
+        """The bridge's whole state: the same JSON its socket pushes (A31)."""
+        if self._session is None:
+            raise ConnectionError("HttpTransport not started")
+        async with self._session.get(self.url) as r:
+            if r.status >= 400:
+                raise ConnectionError(f"state read returned HTTP {r.status}")
+            return await r.text()
 
     def send(self, payload: dict[str, int]) -> None:
         if self._session is None or self.loop is None:

@@ -82,6 +82,12 @@ RB-VOR reconnects with exponential backoff (0.5 s → 30 s). After the
 configured grace period without a connection it releases the SDR and goes idle
 rather than continue transmitting to a bridge it can no longer hear from.
 
+The bridge socket says nothing on connect and pushes only when a value changes. So
+after every connection RB-VOR reads the state once with `GET` on `bridge.rest_url`,
+and treats the answer as a frame. A restarted daemon therefore returns to the
+`vorfreq` RB-01 already holds, and a bridge that drops and returns needs no new
+command. If the read fails, the connection is made again and the read repeated.
+
 ---
 
 ## 3. Produced — HTTP POST
@@ -131,7 +137,7 @@ usable bearing exists:
 | Code | Meaning | RB-VOR state(s) |
 |---|---|---|
 | 0 | OFF / disabled / no frequency / idle | IDLE, INVALID_FREQ |
-| 1 | antenna disconnected / no signal / very low data | NO_SIGNAL |
+| 1 | antenna disconnected / no signal / very low data, or a channel is selected and the dongle cannot be had | NO_SIGNAL, NO_SDR |
 | 2 | tuning | TUNING |
 | 3 | acquiring | ACQUIRING |
 | 4 | degraded (usable but poor) | DEGRADED |
@@ -226,6 +232,7 @@ These are normative. A consumer that does not do these things is not conforming.
 | IDLE | all zero | no channel selected |
 | INVALID_FREQ / out of airband | all zero, once | frequency rejected (requirement 4) |
 | TUNING | all zero, **before the tuner moves** | previous bearing already invalidated |
+| NO_SDR | `vorstatus` 1, `vorfreqactive` the selected channel, the rest zero | dongle unavailable, for example held by rb-sdr-radio; retried every `sdr.retry_s` |
 | ACQUIRING | all zero, sent once | settling |
 | TRACKING | bearing + value ≥ 40 | usable |
 | DEGRADED | bearing + value 1–39 | usable but poor |

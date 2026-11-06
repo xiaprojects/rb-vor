@@ -440,8 +440,9 @@ class Rb01Standin:
 
     GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-    def __init__(self, period_s=0.05):
+    def __init__(self, period_s=0.05, payload=b'{"vorfreq":109.4}'):
         self.period_s = period_s
+        self.payload = payload       # None: silent, as RB-01 is until a value changes
         self.connections = 0
         self._writers = []
 
@@ -471,11 +472,12 @@ class Rb01Standin:
                      b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
         self.connections += 1
         self._writers.append(writer)
-        payload = b'{"vorfreq":109.4}'
+        payload = self.payload
         try:
             while True:            # write-only from here on, like RB-01
-                writer.write(bytes([0x81, len(payload)]) + payload)
-                await writer.drain()
+                if payload is not None:
+                    writer.write(bytes([0x81, len(payload)]) + payload)
+                    await writer.drain()
                 await asyncio.sleep(self.period_s)
         except (ConnectionError, asyncio.CancelledError):
             pass
@@ -517,6 +519,111 @@ def _run_client(url, seconds):
         return connected, time.monotonic() - t0
 
     return channels, drops, scenario
+
+
+def _with_state_read(url, fetch):
+    """A client as the daemon builds it, on a bridge at `url`."""
+    channels = []
+    client = BridgeClient(dict(BASE["bridge"], ws_url=url, ws_reconnect_min_s=0.01,
+                               ws_reconnect_max_s=0.02),
+                          on_channel=channels.append, fetch_state=fetch)
+    return client, channels
+
+
+async def _until(test, timeout=3.0):
+    import asyncio
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not test() and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.005)
+    return test()
+
+
+def test_a_channel_set_before_we_connected_is_picked_up():
+    """A31. RB-01 says nothing on connect: without the read a restarted daemon
+    stays deaf to the channel it holds, and pressing that station again changes
+    no value, so nothing is ever pushed."""
+    import asyncio
+
+    async def scenario():
+        async with Rb01Standin(payload=None) as bridge:
+            async def fetch():
+                return '{"vorfreq":109.4,"vorradial":12}'
+            client, channels = _with_state_read(bridge.url, fetch)
+            task = asyncio.create_task(client.run())
+            assert await _until(lambda: channels)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            return channels
+
+    assert asyncio.run(scenario()) == [109.4]
+
+
+def test_the_state_read_cannot_overwrite_a_newer_frame():
+    """Subscribed before the read and consumed after it: the read is first, so
+    the frame that was pushed while it was in the air is what stays."""
+    import asyncio
+
+    async def scenario():
+        async with Rb01Standin(payload=b'{"vorfreq":113.8}') as bridge:
+            async def fetch():
+                await asyncio.sleep(0.1)       # a frame arrives during this
+                return '{"vorfreq":109.4}'
+            client, channels = _with_state_read(bridge.url, fetch)
+            task = asyncio.create_task(client.run())
+            assert await _until(lambda: len(channels) >= 2)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            return channels
+
+    assert asyncio.run(scenario())[:2] == [109.4, 113.8]
+
+
+def test_a_failed_state_read_is_read_again():
+    """Going on without it is the deafness the read exists to end."""
+    import asyncio
+
+    async def scenario():
+        async with Rb01Standin(payload=None) as bridge:
+            answers = [ConnectionError("HTTP 500"), ConnectionError("HTTP 500"),
+                       '{"vorfreq":109.4}']
+
+            async def fetch():
+                answer = answers.pop(0)
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+            client, channels = _with_state_read(bridge.url, fetch)
+            task = asyncio.create_task(client.run())
+            assert await _until(lambda: channels)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            return channels, bridge.connections
+
+    channels, connections = asyncio.run(scenario())
+    assert channels == [109.4]
+    assert connections == 3
+
+
+def test_an_empty_bridge_changes_nothing():
+    """Absent is "no change" here as in a frame, not an order to go idle."""
+    import asyncio
+
+    async def scenario():
+        async with Rb01Standin(payload=None) as bridge:
+            read = []
+
+            async def fetch():
+                read.append(True)
+                return '{"gpsTrack":90.0}'
+            client, channels = _with_state_read(bridge.url, fetch)
+            task = asyncio.create_task(client.run())
+            assert await _until(lambda: read)
+            await asyncio.sleep(0.02)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            return channels
+
+    assert asyncio.run(scenario()) == []
 
 
 def test_link_to_a_bridge_that_never_answers_pings_stays_up(monkeypatch):

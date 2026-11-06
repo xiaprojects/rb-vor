@@ -102,6 +102,106 @@ def test_unopenable_sdr_stops_the_daemon_with_exit_code_3(tmp_path, monkeypatch)
     assert rc == 3
 
 
+def test_under_a_bridge_a_refused_dongle_waits_and_the_channel_is_restored(
+        tmp_path, monkeypatch):
+    """A30 and A31 together, through `_run()`: the daemon restarted while the
+    radio held the dongle, against a bridge that, like RB-01, says nothing on
+    connect. It must read the channel from the bridge, survive being refused and
+    take the dongle when it comes free, all without another command."""
+    import argparse
+    import asyncio
+    import json
+    import time
+
+    import numpy as np
+    from aiohttp import web
+
+    from rbvor import sdr as sdr_mod
+    from rbvor.__main__ import _run
+    from rbvor.config import load
+    from rbvor.sdr import SdrError
+
+    class Device:
+        name = "test double"
+        tuner = ""
+
+        def __init__(self):
+            self.tuned = []
+            self.closed = False
+
+        def set_frequency(self, hz):
+            self.tuned.append(hz)
+
+        def read(self, n):
+            time.sleep(0.01)
+            return np.zeros(n, dtype=np.complex64)
+
+        def close(self):
+            self.closed = True
+
+    attempts, device = [], Device()
+
+    def claim(cfg, order=None):
+        attempts.append(time.monotonic())
+        if len(attempts) < 3:
+            raise SdrError("usb_claim_interface error -6")
+        return device
+
+    monkeypatch.setattr(sdr_mod, "open_device", claim)
+    posts = []
+
+    async def state(request):
+        return web.json_response({"vorfreq": 109.4})
+
+    async def post(request):
+        posts.append(await request.json())
+        return web.json_response({})
+
+    async def socket(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive()
+        return ws
+
+    async def scenario():
+        app = web.Application()
+        app.router.add_get("/bridge/float", state)
+        app.router.add_post("/bridge/float", post)
+        app.router.add_get("/bridge/float/ws", socket)
+        runner = web.AppRunner(app, shutdown_timeout=0.1)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+
+        path = _bench_config(tmp_path)
+        cfg = json.loads(path.read_text())
+        cfg["sdr"]["retry_s"] = 0.1
+        cfg["bridge"].update(ws_url=f"ws://127.0.0.1:{port}/bridge/float/ws",
+                             rest_url=f"http://127.0.0.1:{port}/bridge/float")
+        path.write_text(json.dumps(cfg))
+        args = argparse.Namespace(dry_run=False, replay=None, freq=None, quiet=True,
+                                  status_every=2.0, log_level=None, csv=None)
+        daemon = asyncio.create_task(_run(load(path), args))
+        deadline = time.monotonic() + 10
+        while not device.tuned and not daemon.done() and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        while (not any(p["vorstatus"] >= 2 for p in posts)
+               and not daemon.done() and time.monotonic() < deadline):
+            await asyncio.sleep(0.02)
+        assert not daemon.done(), daemon.exception()
+        daemon.cancel()
+        await asyncio.gather(daemon, return_exceptions=True)
+        await runner.cleanup()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=20))
+
+    assert len(attempts) == 3
+    assert device.tuned == [109_400_000 - 64_000]      # the bench offset
+    waiting = [p for p in posts if p["vorstatus"] == 1]
+    assert waiting and waiting[0]["vorfreqactive"] == 109400
+
+
 def test_self_test_passes_without_any_config_present(tmp_path):
     """A19: the self-test proves the SOFTWARE works, independent of config.
 

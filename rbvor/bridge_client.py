@@ -20,7 +20,13 @@ ignored too, silently: the bridge carries traffic for the whole platform and
 will grow fields that are none of our business.
 
 The parse is pure and separately testable. The async loop around it is thin on
-purpose -- it does reconnection and nothing else.
+purpose -- it does reconnection and the state read below, and nothing else.
+
+The socket says nothing on connect, and pushes the state only when a POST changes
+a value (CLAUDE.md A31). So after every connection the state is read once with a
+`GET` of `bridge.rest_url`, which is the same JSON as a frame. Without it a
+restarted daemon stays deaf to the channel RB-01 already holds, and pressing that
+station again changes no value, so nothing is pushed.
 
 The link is lost only when the socket is. RB-01 has no ping/pong and does not
 echo anything, close frames included, so the `websockets` keepalive (ping every
@@ -46,7 +52,7 @@ import asyncio
 import json
 import logging
 import socket
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -156,19 +162,22 @@ class BridgeClient:
     """Async WebSocket client with exponential backoff.
 
     `on_channel` receives a frequency in MHz or None. `on_connect` and
-    `on_disconnect` drive the controller's grace timer.
+    `on_disconnect` drive the controller's grace timer. `fetch_state` returns
+    the bridge's whole state as text; None skips the read, for a dry run.
     """
 
     def __init__(self, cfg_bridge: dict,
                  on_channel: Callable[[float | None], None],
                  on_connect: Callable[[], None] | None = None,
                  on_disconnect: Callable[[], None] | None = None,
-                 on_gps_track: Callable[[float], None] | None = None):
+                 on_gps_track: Callable[[float], None] | None = None,
+                 fetch_state: Callable[[], Awaitable[str]] | None = None):
         self.cfg = cfg_bridge
         self.on_channel = on_channel
         self.on_connect = on_connect
         self.on_disconnect = on_disconnect
         self.on_gps_track = on_gps_track
+        self.fetch_state = fetch_state
         self.connected = False
         self.frames = 0
         self.bad_frames = 0
@@ -201,10 +210,17 @@ class BridgeClient:
                                               close_timeout=CLOSE_TIMEOUT_S) as ws:
                     enable_tcp_keepalive(ws.transport.get_extra_info("socket"))
                     self.connected = True
-                    backoff = self.cfg["ws_reconnect_min_s"]
                     if self.on_connect:
                         self.on_connect()
                     log.info("bridge connected: %s", self.cfg["ws_url"])
+                    # Subscribed first, so a change during the GET cannot be
+                    # missed, and awaited before reading, so its answer cannot
+                    # overwrite a newer frame. A failure is a failed connection:
+                    # going on without the state is the deafness this read
+                    # exists to end, so it reconnects and reads again.
+                    if self.fetch_state is not None:
+                        self.handle_text(await self.fetch_state())
+                    backoff = self.cfg["ws_reconnect_min_s"]
                     async for message in ws:
                         if self._stop.is_set():
                             break

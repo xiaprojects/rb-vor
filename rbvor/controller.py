@@ -53,6 +53,7 @@ from rbvor import freqrules
 from rbvor.bearing import BearingTracker, to_int_bearing
 from rbvor.dsp import VorDemod
 from rbvor.quality import ACCEPTABLE, QualityEstimator
+from rbvor.sdr import SdrError
 
 __all__ = ["State", "Controller", "SdrPort", "PublisherPort"]
 
@@ -63,6 +64,7 @@ class State(StrEnum):
     IDLE = "IDLE"
     INVALID_FREQ = "INVALID_FREQ"
     TUNING = "TUNING"
+    NO_SDR = "NO_SDR"
     ACQUIRING = "ACQUIRING"
     TRACKING = "TRACKING"
     DEGRADED = "DEGRADED"
@@ -97,7 +99,8 @@ class Controller:
     def __init__(self, cfg, sdr: SdrPort, publisher: PublisherPort,
                  clock: Callable[[], float] = time.monotonic,
                  notify: Callable[[], None] | None = None,
-                 recorder=None, solution_sink=None, obs_sink=None):
+                 recorder=None, solution_sink=None, obs_sink=None,
+                 sdr_retry_s: float | None = None):
         self.cfg = cfg
         self.sdr = sdr
         self.publisher = publisher
@@ -115,6 +118,10 @@ class Controller:
         self.recorder = recorder
         self.solution_sink = solution_sink
         self.obs_sink = obs_sink
+        #: A30: seconds between attempts on a dongle that cannot be had, or None
+        #: to let the SdrError through. The daemon sets it when the channel
+        #: comes from the bridge; in bench mode nothing will free the dongle.
+        self.sdr_retry_s = sdr_retry_s
 
         self.demod = VorDemod(cfg.dsp)
         self.tracker = BearingTracker(cfg.bearing, history=cfg.quality.history)
@@ -126,6 +133,7 @@ class Controller:
 
         self._pending: tuple[int, float] | None = None
         self._settle_at = 0.0
+        self._sdr_retry_at = 0.0
         self._discard_next = False
         self._consecutive_valid = 0
         self._last_good: int | None = None
@@ -159,8 +167,10 @@ class Controller:
             # dongle is free (and cool) when no VOR is selected. INVALID_FREQ is
             # the "no valid frequency" case and releases too. The reader reopens
             # automatically on the next set_frequency (retune), so this is safe
-            # to do on every entry; SdrReader.close() is idempotent.
-            if state in (State.IDLE, State.INVALID_FREQ):
+            # to do on every entry; SdrReader.close() is idempotent. NO_SDR
+            # releases because a retune can fail with the device already open
+            # (A30), and waiting must not hold what the other program wants.
+            if state in (State.IDLE, State.INVALID_FREQ, State.NO_SDR):
                 self._release_sdr()
 
     def _release_sdr(self) -> None:
@@ -175,6 +185,7 @@ class Controller:
         State.IDLE: 0,           # OFF / Disabled / No frequency / IDLE
         State.INVALID_FREQ: 0,   # no valid frequency selected
         State.NO_SIGNAL: 1,      # antenna disconnected / no signal / very low data
+        State.NO_SDR: 1,         # a channel is selected, no dongle to hear it on (A30)
         State.TUNING: 2,
         State.ACQUIRING: 3,
         State.DEGRADED: 4,       # usable but poor -- a tracked bearing, low quality
@@ -451,6 +462,15 @@ class Controller:
                 self._retune(ch)
                 return
 
+        if self.state is State.NO_SDR and now >= self._sdr_retry_at:
+            # Published only if it worked: a refused attempt changes nothing,
+            # so the plate must not flash TUNING every retry_s.
+            self._enter(State.TUNING, f"tuning {self.channel_khz / 1000:.3f} MHz")
+            self._tune()
+            if self.state is State.TUNING:
+                self._publish(None, 0, "SDR available")
+            return
+
         if self.state is State.TUNING and now >= self._settle_at:
             self._enter(State.ACQUIRING, "settled")
             self._publish(None, 0, "acquiring")
@@ -485,5 +505,24 @@ class Controller:
         if self.recorder is not None:
             self.recorder.set_channel(channel_khz * 1000)   # so a flag capture names its channel
         self._publish(None, 0, f"retune to {channel_khz / 1000:.3f} MHz")
-        self.sdr.set_frequency(channel_khz * 1000)
+        self._tune()
+
+    def _tune(self) -> None:
+        """Move the tuner, which claims the dongle if the daemon does not hold it.
+
+        AMENDMENT A30: a dongle that cannot be had is a state, not a crash. One
+        USB dongle is shared with rb-sdr-radio, so being refused is normal when
+        the pilot selects a VOR with the radio on. The channel stays selected,
+        `vorstatus` says there is nothing to use, and the dongle is tried again
+        every `sdr.retry_s` until it is free or the channel is dropped.
+        """
+        try:
+            self.sdr.set_frequency(self.channel_khz * 1000)
+        except SdrError as e:
+            if self.sdr_retry_s is None:
+                raise
+            self._sdr_retry_at = self.clock() + self.sdr_retry_s
+            self._enter(State.NO_SDR, f"SDR unavailable: {e}")
+            self._publish(None, 0, self.last_reason)
+            return
         self._settle_at = self.clock() + self.cfg.sdr["settle_ms"] / 1000.0
