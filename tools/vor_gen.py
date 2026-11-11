@@ -155,12 +155,16 @@ class VorParams:
         return 0.0, +r          # dvor-reversed: decodes to -radial, on purpose
 
 
-def _autolevel(p: VorParams, probe_s: float = 0.25, headroom: float = 0.92) -> float:
+def _autolevel(p, probe_s: float = 0.25, headroom: float = 0.92, gen=None) -> float:
     """Choose a digital level so that signal+noise fits the container.
 
     Measured, not estimated: a short probe is generated at unit level with the
     same seed and impairments, and the level is set from its 99.995th percentile
     peak. Returns a plain float, so a run is still fully reproducible.
+
+    `gen` is the block generator to probe, `generate_blocks` by default;
+    `tools/loc_gen.py` passes its own (A33). Any params object with `level`,
+    `seconds`, `fs`, `block` and `_intervals` works.
     """
     import copy
     probe = copy.copy(p)
@@ -168,7 +172,7 @@ def _autolevel(p: VorParams, probe_s: float = 0.25, headroom: float = 0.92) -> f
     probe.seconds = min(probe_s, p.seconds)
     probe.block = int(probe.seconds * p.fs) + 1
     probe._intervals = p._intervals
-    z = next(generate_blocks(probe))
+    z = next((gen or generate_blocks)(probe))
     peak = float(np.percentile(np.maximum(np.abs(z.real), np.abs(z.imag)), 99.995))
     return headroom / max(peak, 1e-9)
 
@@ -216,6 +220,21 @@ def _phase(f: float, n0: int, n: int, fs: int) -> np.ndarray:
     return 2.0 * np.pi * np.mod(f * idx / fs, 1.0)
 
 
+def add_channel_noise(z: np.ndarray, snr_db: float, fs: int,
+                      rng: np.random.Generator) -> np.ndarray:
+    """Add white complex Gaussian noise for `snr_db` in the CHANNEL_BW_HZ channel.
+
+    SNR is specified in the CHANNEL_BW_HZ channel, but the noise is spread over
+    the whole sample rate, so scale accordingly. Signal power is measured on
+    the block itself. Shared with `tools/loc_gen.py` (A33).
+    """
+    n = z.size
+    p_sig = float(np.mean(np.abs(z) ** 2))
+    p_noise = p_sig / (10 ** (snr_db / 10.0)) * (fs / CHANNEL_BW_HZ)
+    sigma = np.sqrt(p_noise / 2.0)
+    return z + rng.normal(0, sigma, n) + 1j * rng.normal(0, sigma, n)
+
+
 def generate_blocks(p: VorParams) -> Iterator[np.ndarray]:
     """Yield complex64 blocks of the modelled signal, with noise and fading."""
     rng = np.random.default_rng(p.seed)
@@ -248,12 +267,7 @@ def generate_blocks(p: VorParams) -> Iterator[np.ndarray]:
         z = (p.level * m * np.exp(1j * carrier_phase)).astype(np.complex128)
 
         if p.snr_db is not None:
-            # SNR is specified in the CHANNEL_BW_HZ channel, but the noise is
-            # spread over the whole sample rate, so scale accordingly.
-            p_sig = float(np.mean(np.abs(z) ** 2))
-            p_noise = p_sig / (10 ** (p.snr_db / 10.0)) * (p.fs / CHANNEL_BW_HZ)
-            sigma = np.sqrt(p_noise / 2.0)
-            z = z + rng.normal(0, sigma, n) + 1j * rng.normal(0, sigma, n)
+            z = add_channel_noise(z, p.snr_db, p.fs, rng)
 
         n0 += n
         yield z.astype(np.complex64)

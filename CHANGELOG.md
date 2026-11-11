@@ -1,3 +1,44 @@
+## Unreleased — ILS localizer, phase A, shipped disabled (CLAUDE.md A33–A38, D9) — 2026-11-10
+
+- **ILS localizer decoding**, off by default (`"loc": {"enabled": false}`).
+  Enabled, a localizer channel posted to `vorfreq` is tuned and decoded instead
+  of being rejected, and the DDM is published. Measured on synthetic signals
+  only (`docs/loc-sweep.md`); no real localizer has been decoded, so it stays
+  off until one has (plan L7, open item O23). Supplemental, not approach
+  guidance; a back course reads reversed.
+- **RB-VOR-IF v2.3** (`docs/RB-VOR-IF-v2.3.md`): six `loc*` fields —
+  `locstatus`, `locdev` (% of full scale, + = fly left, **0 unless
+  `locstatus >= 4`**), `locddm`, `locsdm`, `locsnr`, `locfreqactive` — on
+  every payload of a receiver with `loc.enabled`, and on none without it, whose
+  wire stays byte-for-byte v2.2. On a localizer channel every `vor*` field is 0,
+  so a v2.2 plate shows OFF, never a radial. The v2.3 text also corrects v2.2's
+  description of zeroed bearing fields, which the code stopped doing in 1.0.0.
+- **Noise never reads as an approach.** Noise decodes as DDM ≈ 0, a centred
+  needle, so validity comes from tone SNR, sum of depths and a steady tone
+  frequency, never from the DDM. 0 valid windows in 1100 noise-only windows
+  across five levels and four seeds (`docs/loc-sweep.md`), and no usable status
+  through the full state machine in six 20 s noise runs (`tests/test_loc_controller.py`).
+- **Tone frequencies anywhere in the legal ±2.5 % decode**: a search, not a
+  fixed bin. A fixed bin 1 % off nominal points the needle the wrong way.
+- **Weak signals no longer under-read the deviation**: the DDM is corrected
+  for the measured envelope compression, but never scaled down (D9).
+- New: `rbvor/loc.py`, `tools/loc_gen.py` (same `LocParams` /
+  `generate_blocks` shape as `vor_gen`), `tools/loc_sweep.py`;
+  `vor_replay.py` decodes a localizer capture from its sidecar frequency;
+  `vor_capture.py` accepts localizer channels; the self-test has a localizer
+  stage; `mock_bridge.py` validates v2.3.
+- `freqrules`: `is_loc_frequency()`, `loc_channels()`, and `classify_navaid()`
+  with a `DENIED` class, so a denylisted VOR channel can never be tuned as a
+  localizer. `is_vor_frequency()` and `classify()` behave exactly as before;
+  the reason string for a denied channel no longer claims an odd digit.
+- With the localizer enabled, a clean stop posts an idle payload, so
+  `locstatus` 0 is the last thing on the bridge. A killed daemon still leaves
+  its last values (O25).
+- Localizer solutions go to their own CSV (`loc.csv` beside the VOR one):
+  the solution logger appends under whatever header an existing file has.
+- VOR path unchanged: every existing test passes unmodified, and the real
+  capture replays identically (bit-level fingerprint of every observation).
+
 ## Unreleased — a shared dongle and a restart are no longer failures (CLAUDE.md A30, A31) — 2026-11-06
 
 - **A dongle that cannot be had no longer stops the daemon.** With the channel

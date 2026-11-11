@@ -9,9 +9,14 @@ Outputs a per-window CSV and a summary. Bearing conversion (sign, offset) is
 M4; until then the raw phase difference is reported, which is the radial up to
 one constant.
 
+A capture on an ILS localizer channel (odd 100 kHz digit below 112 MHz) is
+decoded by `rbvor.loc.LocDemod` instead (CLAUDE.md A33), chosen from the
+sidecar's frequency; `--navaid` overrides the choice.
+
 Examples
 --------
     ./vor_replay.py captures/capture_20260724T101530Z_109400.cu8
+    ./vor_replay.py synth_loc.cu8 --csv /tmp/loc.csv          # a localizer
     ./vor_replay.py synth_cvor_137deg.cu8 --csv /tmp/obs.csv --integration 3
 """
 
@@ -268,6 +273,70 @@ def pick_sense(normal: tuple[float, float], swapped: tuple[float, float]) -> tup
     return False, ('NORMAL sense decodes: leave "swap_iq" false for this tuner')
 
 
+LOC_FIELDS = ["t", "ddm", "ddm_corrected", "m90", "m150", "sdm", "tone_offset",
+              "carrier", "noise_est", "snr_db", "carrier_offset_hz", "overrun"]
+
+
+def replay_loc(a, meta) -> int:
+    """Decode a localizer capture (A33) and print a summary."""
+    from rbvor.loc import DDM_FULL_SCALE, LocDemod, LocDspParams, LocQuality
+
+    d = LocDemod(LocDspParams(fs=meta.sample_rate_hz, offset_hz=meta.tuner_offset_hz,
+                              integration_s=a.loc_integration, hop_s=a.loc_hop))
+    obs = []
+    for blk in iq_blocks(a.file, block_samples=a.block, meta=meta):
+        obs += d.push(np.conj(blk) if a.swap_iq else blk)
+    if len(obs) <= a.skip:
+        print(f"{a.file}: only {len(obs)} windows -- capture too short", file=sys.stderr)
+        return 1
+    kept = [o for o in obs[a.skip:] if not o.overrun]
+    q = LocQuality()
+    verdicts = [q.update(o, o.ddm_corrected) for o in kept]
+    valid = sum(not v.flagged for v in verdicts)
+    if a.csv:
+        a.csv.parent.mkdir(parents=True, exist_ok=True)
+        with a.csv.open("w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(LOC_FIELDS)
+            for o in obs:
+                w.writerow([f"{o.t:.3f}", f"{o.ddm:+.5f}", f"{o.ddm_corrected:+.5f}",
+                            f"{o.m90:.5f}", f"{o.m150:.5f}", f"{o.sdm:.5f}",
+                            f"{o.tone_offset:+.5f}", f"{o.carrier:.6g}",
+                            f"{o.noise_est:.6f}", f"{o.snr_db:.2f}",
+                            f"{o.carrier_offset_hz:.1f}", int(o.overrun)])
+    ddm = np.array([o.ddm_corrected for o in kept])
+    print(f"file            {a.file}")
+    print(f"source          {'synthetic' if meta.synthetic else 'live'}  "
+          f"{meta.station} {meta.site} {meta.notes}".rstrip())
+    print(f"fs {meta.sample_rate_hz/1e3:g} kHz  offset {meta.tuner_offset_hz/1e3:+g} kHz  "
+          f"nav {meta.nav_freq_hz/1e6:.3f} MHz  ILS LOCALIZER")
+    print(f"windows         {len(obs)} total, {a.skip} skipped, "
+          f"{len(obs) - a.skip - len(kept)} overrun, {len(kept)} used  "
+          f"({a.loc_integration:g} s window, {a.loc_hop:g} s hop)")
+    print()
+    print(f"  DDM             {ddm.mean():+8.4f}   std {ddm.std():.4f}   "
+          f"({100 * ddm.mean() / DDM_FULL_SCALE:+.0f} % of full scale; "
+          "+ = 150 Hz = fly left)")
+    print(f"  raw m150 - m90  {np.mean([o.ddm for o in kept]):+8.4f}   "
+          "(before the compression correction, D9)")
+    print(f"  SDM             {np.mean([o.sdm for o in kept]):8.3f}   nominal 0.40")
+    print(f"  tone SNR        {np.mean([o.snr_db for o in kept]):8.1f} dB")
+    print(f"  tone offset     {100 * np.mean([o.tone_offset for o in kept]):+8.2f} %  "
+          "(Cat I allows +/-2.5 %)")
+    afc = kept[-1].carrier_offset_hz
+    if abs(afc) >= 50 and meta.nav_freq_hz:
+        print(f"  carrier offset  {afc:+8.0f} Hz  ({afc / meta.nav_freq_hz * 1e6:+.1f} ppm)")
+    print(f"  valid windows   {valid} of {len(kept)} (LocQuality defaults)")
+    syn = meta.synthetic or {}
+    if "ddm" in syn:
+        print()
+        print(f"  expected DDM    {syn['ddm']:+8.4f}   (synthetic sidecar)")
+        print(f"  error           {ddm.mean() - syn['ddm']:+8.4f}")
+    if a.csv:
+        print(f"\n  wrote {a.csv}")
+    return 0
+
+
 def circ_mean_deg(x: np.ndarray) -> float:
     return float(np.rad2deg(np.angle(np.mean(np.exp(1j * np.deg2rad(x))))) % 360.0)
 
@@ -313,6 +382,12 @@ def main(argv=None) -> int:
                     help="decode BOTH spectral senses and report which one works, "
                          "then continue with the winner. This is the test for "
                          "'does my dongle need swap_iq' (A28/O21)")
+    ap.add_argument("--navaid", choices=("auto", "vor", "loc"), default="auto",
+                    help="decode as VOR or localizer; auto = from the sidecar "
+                         "frequency (A33)")
+    ap.add_argument("--loc-integration", type=float, default=1.0,
+                    help="localizer window, s (whole 1/30 s)")
+    ap.add_argument("--loc-hop", type=float, default=0.5)
     a = ap.parse_args(argv)
 
     meta = read_sidecar(a.file)
@@ -333,6 +408,11 @@ def main(argv=None) -> int:
         print()
         print_survey(s, meta)
         print()
+
+    from rbvor.freqrules import is_loc_frequency
+    if a.navaid == "loc" or (a.navaid == "auto"
+                             and is_loc_frequency(meta.nav_freq_hz / 1e6)[0]):
+        return replay_loc(a, meta)
 
     # The 30 Hz tone integration must span a whole number of cycles, or spectral
     # leakage biases the phase and the demodulator produces nothing. Catch the

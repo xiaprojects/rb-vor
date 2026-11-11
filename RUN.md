@@ -68,7 +68,7 @@ If it warns about an RTL-SDR Blog V4 with the stock driver, fix that first (§7)
 ## 2. Prove the software works — no hardware needed
 
 ```bash
-cd /opt/rb-vor
+cd /opt/addons/rb-vor
 python3 -m rbvor --self-test
 ```
 
@@ -154,7 +154,7 @@ journalctl -u rb-vor -f
 Expect `Active: active (running)`, the same state transitions as step 4, and no
 watchdog restarts. The service reads `vorfreq` from the bridge WebSocket and
 POSTs `{"vorradial", "vorsnr", "voram", "vorstatus", "vorsub", "vorfreqactive"}`
-to the bridge whenever a field changes (RB-VOR-IF v2.2, `docs/RB-VOR-IF-v2.2.md`).
+to the bridge whenever a field changes (RB-VOR-IF v2.3, `docs/RB-VOR-IF-v2.3.md`).
 
 ---
 
@@ -265,6 +265,28 @@ INFO rbvor.sdr: SDR open: pyrtlsdr serial 'VOR01' (index 2)
 `tools/vor_capture.py` takes the same `--device-serial` / `--device-index` and
 records the device in the sidecar, so a capture and a live decode can never
 disagree about which antenna they heard.
+
+## ILS localizer (disabled by default)
+
+Localizer decoding (CLAUDE.md A33–A38, RB-VOR-IF v2.3) ships off. It has been
+measured only on synthetic signals (`docs/loc-sweep.md`); nobody has decoded a
+real localizer with it yet. To try it on a bench:
+
+```bash
+# a synthetic localizer: half scale right of course, tones 2 % off, 15 dB
+python3 tools/loc_gen.py --ddm 0.0775 --tone-offset 0.02 --snr-db 15 -o loc
+python3 tools/vor_replay.py loc.cu8          # picks the localizer path from 109.5 MHz
+```
+
+and add `"loc": {"enabled": true}` to the config to let the daemon tune
+localizer channels. A ground capture near an ILS runway (`tools/vor_capture.py
+-f 109.5 ...` with the frequency and ident read off the chart, never guessed)
+replays the same way. `vor_replay.py` prints the DDM (+ = 150 Hz predominates =
+right of the front course = fly left), SDM, tone SNR, tone offset and how many
+windows the validity check accepts.
+
+Not approach guidance. A back course reads reversed. `locdev` is 0 unless
+`locstatus >= 4`; a consumer must not draw a deviation from anything else.
 
 ## 7. RTL-SDR Blog V4
 

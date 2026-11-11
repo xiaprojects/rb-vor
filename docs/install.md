@@ -37,7 +37,7 @@ sudo ./install.sh
 
 The installer creates an unprivileged `rb-vor` user, installs udev rules so the
 dongle is reachable without root, blacklists the DVB-T kernel driver, installs
-to `/opt/rb-vor` with config in `/etc/rb-vor`, validates that config, and enables
+to `/opt/addons/rb-vor` with config in `/etc/rb-vor`, validates that config, and enables
 a `Type=notify` systemd unit with a 10 s watchdog.
 
 It deliberately does **not** start the service, because a fresh install is
@@ -55,7 +55,7 @@ flags and never a bearing. This is deliberate — an uncalibrated bearing looks
 plausible and is wrong, which is the worst failure this system has.
 
 ```bash
-cd /opt/rb-vor
+cd /opt/addons/rb-vor
 python3 tools/vor_calibrate.py --json /tmp/bearing.json
 # merge the "bearing" block into /etc/rb-vor/rb-vor.json
 sudo systemctl start rb-vor
@@ -92,7 +92,7 @@ they change often enough that copying them here would age badly.
 
 ```bash
 # offline, no hardware: decode a synthetic signal end to end
-cd /opt/rb-vor
+cd /opt/addons/rb-vor
 python3 tools/vor_gen.py --radial 137 --seconds 10 --snr-db 25 -o /tmp/t
 python3 tools/vor_replay.py /tmp/t.cu8
 

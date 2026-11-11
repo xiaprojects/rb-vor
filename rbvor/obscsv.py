@@ -64,3 +64,42 @@ class ObsCsvSink:
     def close(self) -> None:
         if not self._fh.closed:
             self._fh.close()
+
+
+#: A33: the localizer twin, a separate file (``<csv>-loc.csv``) because the
+#: VOR header above is a fixed, requested contract.
+LOC_FIELDS = ["t", "frequency", "ddm", "ddm_corrected", "m90", "m150", "sdm",
+              "tone_offset", "carrier", "noise_est", "snr_db", "carrier_offset_hz",
+              "overrun"]
+
+
+def loc_path_for(path: str | Path) -> Path:
+    """`obs.csv` -> `obs-loc.csv`."""
+    p = Path(path)
+    return p.with_name(f"{p.stem}-loc{p.suffix or '.csv'}")
+
+
+class LocObsCsvSink:
+    """Per-window localizer dump: ``controller.loc_obs_sink``."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self._fh = self.path.open("w", newline="")
+        self._w = csv.writer(self._fh)
+        self._w.writerow(LOC_FIELDS)
+        self._fh.flush()
+        self.rows = 0
+
+    def __call__(self, obs, freq_khz: int) -> None:
+        self._w.writerow([
+            f"{obs.t:.3f}", int(freq_khz), f"{obs.ddm:+.5f}", f"{obs.ddm_corrected:+.5f}",
+            f"{obs.m90:.5f}", f"{obs.m150:.5f}", f"{obs.sdm:.5f}",
+            f"{obs.tone_offset:+.5f}", f"{obs.carrier:.6g}", f"{obs.noise_est:.6f}",
+            f"{obs.snr_db:.2f}", f"{obs.carrier_offset_hz:.1f}", int(obs.overrun),
+        ])
+        self._fh.flush()
+        self.rows += 1
+
+    def close(self) -> None:
+        if not self._fh.closed:
+            self._fh.close()

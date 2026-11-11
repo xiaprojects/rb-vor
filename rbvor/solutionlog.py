@@ -35,7 +35,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-__all__ = ["SolutionRecord", "SOLUTION_SCHEMA", "SolutionLogger", "SCHEMA_VERSION"]
+__all__ = ["SolutionRecord", "SOLUTION_SCHEMA", "SolutionLogger", "SCHEMA_VERSION",
+           "LocSolutionRecord", "LOC_SOLUTION_SCHEMA", "LOC_SCHEMA_VERSION",
+           "loc_schema_markdown"]
 
 log = logging.getLogger("rbvor.solutionlog")
 
@@ -73,6 +75,43 @@ SOLUTION_SCHEMA: dict[str, tuple[str, str]] = {
 }
 
 FIELDS = tuple(SOLUTION_SCHEMA)
+
+#: AMENDMENT A33/A37 -- the localizer log is a SEPARATE file and schema. Adding
+#: columns to SOLUTION_SCHEMA would change the header, and `SolutionLogger`
+#: appends to an existing file without reading its header (it writes one only
+#: to a new or empty file): every row after an upgrade would sit under the old
+#: header, shifted. Checked in tests/test_loc_controller.py.
+LOC_SCHEMA_VERSION = "rb-vor.loc-solution/1"
+
+LOC_SOLUTION_SCHEMA: dict[str, tuple[str, str]] = {
+    "t_utc": ("ISO-8601", "wall-clock time the solution was produced"),
+    "t_mono": ("s", "monotonic time of the publish"),
+    "channel_khz": ("kHz", "tuned localizer channel, integer"),
+    "state": ("enum", "controller state: TRACKING/DEGRADED/NO_SIGNAL/..."),
+    "locstatus": ("0-5", "published status code, >= 4 usable"),
+    "ddm": ("DDM", "published DDM (smoothed, compression-corrected, D9), empty when "
+                   "not usable; + = 150 Hz predominates = fly left"),
+    "valid": ("bool", "true when locstatus >= 4"),
+    "reason": ("text", "human-readable state/flag reason"),
+    "q_sdm": ("0-1", "SDM quality term (SDM / 0.40)"),
+    "q_snr": ("0-1", "tone SNR quality term"),
+    "q_stab": ("0-1", "DDM steadiness about its trend"),
+    "value": ("0-100", "internal localizer quality score; 0 = flagged"),
+    "m90": ("frac", "90 Hz depth, nominal 0.20"),
+    "m150": ("frac", "150 Hz depth, nominal 0.20"),
+    "ddm_raw": ("DDM", "m150 - m90 of the last window, before correction"),
+    "ddm_corrected": ("DDM", "raw DDM x max(1, 0.40 / SDM), before smoothing"),
+    "sdm": ("frac", "m90 + m150, nominal 0.40"),
+    "snr_db": ("dB", "mean tone amplitude against the off-tone bins"),
+    "tone_offset": ("frac", "found fractional tone-frequency offset (A34)"),
+    "carrier": ("a.u.", "smoothed carrier magnitude"),
+    "carrier_offset_hz": ("Hz", "carrier offset from the nominal down-mix (A25)"),
+    "gps_track": ("deg true", "aircraft track from the bridge, diagnostics only"),
+    "overrun": ("bool", "window touched a sample gap"),
+    "iq_ref": ("filename", "IQ capture that includes this window, if any"),
+}
+
+LOC_FIELDS = tuple(LOC_SOLUTION_SCHEMA)
 
 
 @dataclass
@@ -119,10 +158,60 @@ class SolutionRecord:
         return {"schema": SCHEMA_VERSION, **{k: getattr(self, k) for k in FIELDS}}
 
 
-class SolutionLogger:
-    """Append-only 1 Hz CSV writer. Never blocks the DSP; failures are dropped."""
+def _fmt_cell(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, float):
+        return f"{v:.5g}"
+    return v
 
-    def __init__(self, path: str | Path | None):
+
+@dataclass
+class LocSolutionRecord:
+    """One localizer row (A33). Built by the controller at publish time."""
+
+    t_utc: str
+    t_mono: float
+    channel_khz: int | None
+    state: str
+    locstatus: int
+    ddm: float | None
+    valid: bool
+    reason: str = ""
+    q_sdm: float = 0.0
+    q_snr: float = 0.0
+    q_stab: float = 0.0
+    value: int = 0
+    m90: float = 0.0
+    m150: float = 0.0
+    ddm_raw: float = 0.0
+    ddm_corrected: float = 0.0
+    sdm: float = 0.0
+    snr_db: float = 0.0
+    tone_offset: float = 0.0
+    carrier: float = 0.0
+    carrier_offset_hz: float = 0.0
+    gps_track: float | None = None
+    overrun: bool = False
+    iq_ref: str = ""
+
+    def as_row(self) -> dict[str, Any]:
+        return {k: _fmt_cell(getattr(self, k)) for k in LOC_FIELDS}
+
+    def as_cloud_record(self) -> dict[str, Any]:
+        return {"schema": LOC_SCHEMA_VERSION, **{k: getattr(self, k) for k in LOC_FIELDS}}
+
+
+class SolutionLogger:
+    """Append-only 1 Hz CSV writer. Never blocks the DSP; failures are dropped.
+
+    `fields` defaults to the VOR schema; the localizer log passes LOC_FIELDS
+    and its own path (A33)."""
+
+    def __init__(self, path: str | Path | None, fields: tuple[str, ...] = FIELDS):
+        self.fields = tuple(fields)
         self.path = Path(path) if path else None
         self._fh = None
         self._writer: csv.DictWriter | None = None
@@ -137,7 +226,7 @@ class SolutionLogger:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             new = not self.path.exists() or self.path.stat().st_size == 0
             self._fh = self.path.open("a", newline="")
-            self._writer = csv.DictWriter(self._fh, fieldnames=FIELDS)
+            self._writer = csv.DictWriter(self._fh, fieldnames=self.fields)
             if new:
                 self._writer.writeheader()
                 self._fh.flush()
@@ -173,5 +262,14 @@ def schema_markdown() -> str:
     lines = [f"Schema `{SCHEMA_VERSION}`.\n",
              "| field | unit | description |", "|---|---|---|"]
     for name, (unit, desc) in SOLUTION_SCHEMA.items():
+        lines.append(f"| `{name}` | {unit} | {desc} |")
+    return "\n".join(lines) + "\n"
+
+
+def loc_schema_markdown() -> str:
+    """Render LOC_SOLUTION_SCHEMA as a Markdown table for docs/cloud-schema.md."""
+    lines = [f"Schema `{LOC_SCHEMA_VERSION}`.\n",
+             "| field | unit | description |", "|---|---|---|"]
+    for name, (unit, desc) in LOC_SOLUTION_SCHEMA.items():
         lines.append(f"| `{name}` | {unit} | {desc} |")
     return "\n".join(lines) + "\n"

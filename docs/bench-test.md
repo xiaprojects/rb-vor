@@ -36,7 +36,7 @@ tune and produces nothing usable in our band — total failure, no error message
 ## Stage 1 — software self test, no hardware
 
 ```bash
-cd /opt/rb-vor
+cd /opt/addons/rb-vor
 python3 -m rbvor --self-test
 ```
 

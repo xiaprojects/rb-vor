@@ -32,6 +32,16 @@ the tracker and quality history are flushed and the machine returns to
 ACQUIRING -- stale dispersion from a signal that has gone must not linger and
 make the next acquisition look good.
 
+AMENDMENT A33 -- localizer mode
+-------------------------------
+With `loc.enabled`, a localizer channel is tuned and decoded by
+`rbvor.loc.LocDemod` instead of being rejected. The mode is fixed per tuned
+channel by `freqrules`, so one demodulator runs at a time and every state of
+the table above is reused. On a localizer channel the vor* fields read as a
+rejected frequency does in v2.2 (all 0), the loc* fields carry the localizer,
+and both go out in one POST. With `loc.enabled` false nothing here runs and the
+payload is v2.2's six keys, byte for byte.
+
 Internally `vorsignal == 0` still means "this bearing is not to be trusted", in
 every state, always. It is not on the wire: since AMENDMENT A20 the payload is
 never zeroed, and `vorstatus` (>= 4 == usable) is the only validity signal a
@@ -52,12 +62,16 @@ import numpy as np
 from rbvor import freqrules
 from rbvor.bearing import BearingTracker, to_int_bearing
 from rbvor.dsp import VorDemod
+from rbvor.loc import LocDemod, LocQuality
 from rbvor.quality import ACCEPTABLE, QualityEstimator
 from rbvor.sdr import SdrError
 
 __all__ = ["State", "Controller", "SdrPort", "PublisherPort"]
 
 log = logging.getLogger("rbvor.controller")
+
+#: A38: hysteresis on the localizer's TRACKING/DEGRADED split, score points.
+LOC_SPLIT_HYSTERESIS = 5
 
 
 class State(StrEnum):
@@ -100,7 +114,8 @@ class Controller:
                  clock: Callable[[], float] = time.monotonic,
                  notify: Callable[[], None] | None = None,
                  recorder=None, solution_sink=None, obs_sink=None,
-                 sdr_retry_s: float | None = None):
+                 sdr_retry_s: float | None = None,
+                 loc_solution_sink=None, loc_obs_sink=None):
         self.cfg = cfg
         self.sdr = sdr
         self.publisher = publisher
@@ -126,6 +141,21 @@ class Controller:
         self.demod = VorDemod(cfg.dsp)
         self.tracker = BearingTracker(cfg.bearing, history=cfg.quality.history)
         self.quality = QualityEstimator(cfg.quality)
+
+        # A33: the localizer. Built only when enabled, so a disabled feature
+        # costs nothing and changes nothing. `mode` is fixed per tuned channel.
+        self.loc_cfg = cfg.loc if hasattr(cfg, "loc") else None
+        self.loc_enabled = bool(self.loc_cfg and self.loc_cfg.enabled)
+        self.loc_solution_sink = loc_solution_sink
+        self.loc_obs_sink = loc_obs_sink
+        if self.loc_enabled:
+            self.loc_demod = LocDemod(self.loc_cfg.dsp)
+            self.loc_quality = LocQuality(self.loc_cfg.quality)
+        self.mode: str | None = None          # "vor" | "loc" | None
+        self._loc_hist: list[float] = []      # raw published-form DDMs, for smoothing
+        self._loc_ddm: float | None = None    # smoothed, what goes on the wire
+        self._last_loc_obs = None
+        self._last_loc_q = None
 
         self.state = State.IDLE
         self.channel_khz: int | None = None
@@ -192,7 +222,24 @@ class Controller:
         State.TRACKING: 5,       # tracking, good quality
     }
 
+    def _loc_wire(self):
+        """The loc* half of the payload (A33). Zeros unless on a LOC channel."""
+        from rbvor.publisher import LocWire
+        if self.mode != "loc":
+            return LocWire()
+        o = self._last_loc_obs
+        status = self._STATUS_CODE.get(self.state, 0)
+        return LocWire(status=status,
+                       ddm=self._loc_ddm if o is not None else None,
+                       sdm=o.sdm if o is not None else 0.0,
+                       snr_db=o.snr_db if o is not None else 0.0,
+                       freq_khz=self.channel_khz or 0,
+                       usable=status >= 4 and self._loc_ddm is not None)
+
     def _publish(self, vordir: int | None, vorsignal: int, reason: str = "") -> None:
+        if self.loc_enabled:
+            self._publish_with_loc(vordir, vorsignal, reason)
+            return
         # `vorsignal` (0-100 quality) is retained internally as the validity
         # gate for the solution log: >0 means a real bearing, 0 means
         # flag/idle/out-of-band. The wire format has not carried it since v2.0.
@@ -223,6 +270,66 @@ class Controller:
                                reason=reason or self.last_reason)
         if self.solution_sink is not None:
             self._emit_solution(vordir, vorsignal, reason or self.last_reason)
+
+    def _publish_with_loc(self, vordir, vorsignal: int, reason: str) -> None:
+        """`_publish` when the localizer is enabled: the v2.3 payload, in which
+        a LOC channel reads as a rejected frequency in the vor* fields."""
+        loc = self._loc_wire()
+        why = reason or self.last_reason
+        if self.mode == "loc":
+            self.publisher.publish(None, 0.0, 0.0, state=str(self.state), valid=False,
+                                   status=0, sub_level=0.0, freq_khz=0,
+                                   reason=why, loc=loc)
+            if self.loc_solution_sink is not None:
+                self._emit_loc_solution(why)
+            return
+        valid = vorsignal > 0 and vordir is not None
+        o = self._last_obs
+        self.publisher.publish(vordir, o.snr_db if o else 0.0, o.amp_a if o else 0.0,
+                               state=str(self.state), valid=valid,
+                               status=self._STATUS_CODE.get(self.state, 0),
+                               sub_level=o.sub_level if o else 0.0,
+                               freq_khz=self.channel_khz if self.channel_khz else 0,
+                               reason=why, loc=loc)
+        if self.solution_sink is not None:
+            self._emit_solution(vordir, vorsignal, why)
+
+    def _emit_loc_solution(self, reason: str) -> None:
+        import contextlib
+        from datetime import datetime
+
+        from rbvor.solutionlog import LocSolutionRecord
+        q = self._last_loc_q
+        o = self._last_loc_obs
+        wire = self._loc_wire()
+        rec = LocSolutionRecord(
+            t_utc=datetime.now(tz=UTC).isoformat(),
+            t_mono=self.clock(),
+            channel_khz=self.channel_khz,
+            state=str(self.state),
+            locstatus=wire.status,
+            ddm=self._loc_ddm if wire.usable else None,
+            valid=wire.usable,
+            reason=reason,
+            q_sdm=q.q_sdm if q else 0.0,
+            q_snr=q.q_snr if q else 0.0,
+            q_stab=q.q_stab if q else 0.0,
+            value=q.value if q else 0,
+            m90=o.m90 if o else 0.0,
+            m150=o.m150 if o else 0.0,
+            ddm_raw=o.ddm if o else 0.0,
+            ddm_corrected=o.ddm_corrected if o else 0.0,
+            sdm=o.sdm if o else 0.0,
+            snr_db=o.snr_db if o else 0.0,
+            tone_offset=o.tone_offset if o else 0.0,
+            carrier=o.carrier if o else 0.0,
+            carrier_offset_hz=o.carrier_offset_hz if o else 0.0,
+            gps_track=self._gps_track,
+            overrun=o.overrun if o else False,
+            iq_ref=self._last_iq_ref,
+        )
+        with contextlib.suppress(Exception):         # a log failure never stalls a solution
+            self.loc_solution_sink(rec)
 
     def _emit_solution(self, vordir, vorsignal, reason: str) -> None:
         import contextlib
@@ -272,6 +379,15 @@ class Controller:
         # SNR/AM/SUB would be published against station B's channel (F3).
         self._last_obs = None
         self._last_q = None
+        if self.loc_enabled:
+            # A26 for the localizer: one station's DDM is never attributed to
+            # the next, including across a VOR <-> LOC change.
+            self.loc_demod.reset()
+            self.loc_quality.reset()
+        self._loc_hist = []
+        self._loc_ddm = None
+        self._last_loc_obs = None
+        self._last_loc_q = None
         self._consecutive_valid = 0
         self._last_good = None
         self._last_good_at = None
@@ -285,18 +401,23 @@ class Controller:
             self._pending = None
             if self.state is not State.IDLE:
                 self.channel_khz = None
+                self.mode = None
                 self._flush()
                 self._enter(State.IDLE, "no vorfreq in bridge state")
                 self._published_idle = False
             return
 
         ok, reason = freqrules.is_vor_frequency(mhz, **self._freq_kwargs)
+        if not ok and self.loc_enabled:
+            # A33: a localizer channel is a valid channel in its own right
+            ok = freqrules.is_loc_frequency(mhz, **self._freq_kwargs)[0]
         if not ok:
             self._pending = None
             self.channel_khz = None
             self._flush()
             if self.state is not State.INVALID_FREQ:
                 self._enter(State.INVALID_FREQ, reason)
+                self.mode = None
                 self._publish(None, 0, reason)
             return
 
@@ -344,6 +465,15 @@ class Controller:
         if self.recorder is not None and not gap:
             self.recorder.push(iq)
         published = 0
+        if self.mode == "loc":
+            # A33: only the demodulator of the tuned mode runs
+            for obs in self.loc_demod.push(iq, gap=gap):
+                if self._discard_next:
+                    self._discard_next = False
+                    continue
+                self._handle_loc(obs)
+                published += 1
+            return published
         for obs in self.demod.push(iq, gap=gap):
             if self._discard_next:
                 self._discard_next = False
@@ -425,6 +555,68 @@ class Controller:
                     f"vorsignal {q.value}")
         self._publish(self._last_good, q.value, self.last_reason)
 
+    def _handle_loc(self, obs) -> None:
+        """One localizer window (A33). Mirrors `_handle`, with three
+        differences: no calibration is involved (A2 concerns a phase constant
+        a localizer does not have); validity comes from `LocQuality`, never
+        from the DDM, because noise decodes as DDM ~ 0 (plan 4.1); and nothing
+        is held in NO_SIGNAL -- `locdev` is 0 there, since a held deviation
+        would be a needle that looks valid."""
+        now = self.clock()
+        if self.loc_obs_sink is not None:
+            self.loc_obs_sink(obs, self.channel_khz or 0)
+        self._last_loc_obs = obs
+        if obs.overrun:
+            self._loc_ddm = None
+            self._enter(State.NO_SIGNAL, "sample overrun in window")
+            self._publish(None, 0, "sample overrun in window")
+            return
+        raw = obs.ddm_corrected                 # D9: the published form
+        self._loc_hist = (self._loc_hist + [raw])[-self.loc_cfg.smooth_n:]
+        self._loc_ddm = float(np.mean(self._loc_hist))
+        # A15: the raw value is judged, the smoothed one published.
+        q = self.loc_quality.update(obs, raw)
+        self._last_loc_q = q
+        if q.warming:
+            self._enter(State.ACQUIRING, q.reason)
+            self._publish(None, 0, q.reason)
+            return
+        if q.flagged:
+            self._consecutive_valid = 0
+            self._maybe_capture(q.reason)
+            self._enter(State.NO_SIGNAL, q.reason)
+            self._publish(None, 0, q.reason)
+            return
+        self._consecutive_valid += 1
+        self._last_good_at = now
+        if self.state is State.ACQUIRING and self._consecutive_valid < 2:
+            self._publish(None, 0, "acquiring")
+            return
+        # A38: +/-5 of hysteresis on the TRACKING/DEGRADED split. Without it
+        # a steady 10 dB localizer, whose score sits on the split, flapped
+        # between status 5 and 4 23 times a minute (measured), each a POST and
+        # a label change on the plate.
+        hold = LOC_SPLIT_HYSTERESIS if self.state in (State.TRACKING, State.DEGRADED) else 0
+        tracking = (q.value >= ACCEPTABLE - hold if self.state is State.TRACKING
+                    else q.value >= ACCEPTABLE + hold)
+        self._enter(State.TRACKING if tracking else State.DEGRADED, f"locsignal {q.value}")
+        self._publish(None, q.value, self.last_reason)
+
+    def shutdown(self) -> None:
+        """Clean stop (A33). With the localizer enabled, publish an idle
+        payload -- locstatus 0 -- so the last thing on the bridge is not a
+        usable status with a centred needle: RB-01 has no staleness timeout
+        and rebroadcasts only changes. Disabled, nothing is published, as
+        before. A killed daemon is not covered (open item O25)."""
+        if not self.loc_enabled:
+            return
+        self._pending = None
+        self.channel_khz = None
+        self.mode = None
+        self._flush()
+        self._enter(State.IDLE, "daemon stopping")
+        self._publish(None, 0, self.last_reason)
+
     def _maybe_capture(self, reason: str) -> None:
         if self.recorder is None or self.cfg.record["trigger"] != "on_flag":
             return
@@ -449,6 +641,7 @@ class Controller:
                 and now - self._bridge_lost_at >= self.cfg.bridge["ws_grace_s"]):
             if self.state is not State.IDLE:
                 self.channel_khz = None
+                self.mode = None
                 self._pending = None
                 self._flush()
                 self._enter(State.IDLE, "bridge unreachable")  # releases the SDR
@@ -502,6 +695,9 @@ class Controller:
         self._enter(State.TUNING, f"tuning {channel_khz / 1000:.3f} MHz")
         self._flush()
         self.channel_khz = channel_khz
+        # A33: the mode follows the channel, decided once per retune
+        self.mode = ("loc" if self.loc_enabled and freqrules.is_loc_frequency(
+            channel_khz / 1000.0, **self._freq_kwargs)[0] else "vor")
         if self.recorder is not None:
             self.recorder.set_channel(channel_khz * 1000)   # so a flag capture names its channel
         self._publish(None, 0, f"retune to {channel_khz / 1000:.3f} MHz")

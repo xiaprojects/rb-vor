@@ -19,7 +19,7 @@ Part of the RB-Avionics platform · `xiaprojects/rb-vor` · https://www.rbavioni
 ```bash
 git clone https://github.com/xiaprojects/rb-vor && cd rb-vor
 sudo ./install.sh
-cd /opt/rb-vor
+cd /opt/addons/rb-vor
 python3 -m rbvor --self-test                      # no hardware needed
 python3 tools/vor_calibrate.py --json /tmp/bearing.json
 # merge the "bearing" block into /etc/rb-vor/rb-vor.json
@@ -50,11 +50,13 @@ image to a decoded 109.40 MHz bearing.
 | Interface v2.2 (`vorfreqactive`, status 4/5 split, payload never zeroed, `--csv`) | done — 1.0.0 |
 | A22 offset-convention fix, F3/F5 daemon-liveness fixes, D6 hot-path 3.5× | done |
 | A25 signal chain (filters, 2 s windows, AFC), D7 harmonic estimator (opt-in) | done, 550 tests green — bearing RMS halved, 4× at low SNR with D7 |
+| ILS localizer, phase A (L0–L6): `loc.py`, `loc_gen.py`, `loc_sweep.py`, interface v2.3 | done on synthetic signals, **ships disabled** (`loc.enabled: false`) until a real localizer has been decoded (L7) — see [`docs/loc-sweep.md`](docs/loc-sweep.md) |
 | M10 field campaign | **in progress** — an orbit was flown (see `CLAUDE.md`, "Field campaign"); the GPS-referenced evidence is not yet in the tree (O14) |
 
 Everything except the field campaign is implemented. The interface is
-**RB-VOR-IF v2.2** ([`docs/RB-VOR-IF-v2.2.md`](docs/RB-VOR-IF-v2.2.md)); v1.0,
-v2.0 and v2.1 are retained for reference. See [`CHANGELOG.md`](CHANGELOG.md) for
+**RB-VOR-IF v2.3** ([`docs/RB-VOR-IF-v2.3.md`](docs/RB-VOR-IF-v2.3.md)); v2.3
+adds the localizer fields and is byte-for-byte v2.2 while `loc.enabled` is
+false. v1.0 to v2.2 are retained for reference. See [`CHANGELOG.md`](CHANGELOG.md) for
 measured performance and known limitations.
 
 > **An uncalibrated config publishes no bearing** — `vorradial` stays 0 and
@@ -155,17 +157,21 @@ rather than re-deriving the rule.
 
 | Band | Rule |
 |---|---|
-| 108.000–111.950 | VOR only if the 100 kHz digit is **even**. Odd = ILS localiser, rejected. |
+| 108.000–111.950 | VOR only if the 100 kHz digit is **even**. Odd = ILS localizer: rejected, or decoded with `loc.enabled`. |
 | 112.000–117.950 | every 50 kHz channel is VOR |
 
-`109.40 → VOR` · `109.50 → localiser, rejected` · `108.05 → VOR` ·
-`108.15 → rejected` · `117.975 → off-grid` · `118.00 → out of band`
+`109.40 → VOR` · `109.50 → localizer` · `108.05 → VOR` ·
+`108.15 → localizer` · `117.975 → off-grid` · `118.00 → out of band`
+
+`is_vor_frequency()` behaves exactly as before; `is_loc_frequency()` and
+`loc_channels()` are new, and `classify_navaid()` reports a denylisted channel
+as `DENIED` instead of `LOC` (CLAUDE.md A33).
 
 All comparisons are in integer kHz. Never compare navaid frequencies as floats.
 
 ---
 
-## Interface — RB-VOR-IF v2.2
+## Interface — RB-VOR-IF v2.3
 
 Consumes, over `ws://localhost/bridge`:
 
@@ -192,8 +198,31 @@ an optional keep-alive, `publish.keepalive_s`):
 
 No field is zeroed for validity (1.0.0): a field is 0 only when nothing has been
 measured since the last retune. Full spec:
-[`docs/RB-VOR-IF-v2.2.md`](docs/RB-VOR-IF-v2.2.md) (supersedes doc A §10).
+[`docs/RB-VOR-IF-v2.3.md`](docs/RB-VOR-IF-v2.3.md) (supersedes doc A §10 and
+v2.2).
 Additive fields only within v2.x.
+
+### ILS localizer (v2.3, disabled by default)
+
+With `"loc": {"enabled": true}` a localizer channel posted to `vorfreq` is
+tuned and decoded, and every payload carries six more fields:
+
+| Field | Unit | Meaning |
+|---|---|---|
+| `locstatus` | 0–5 | same codes as `vorstatus`; **`>= 4` usable** |
+| `locdev` | % of full scale, ±100 | deviation, DDM 0.155 = 100; **+ = 150 Hz predominates = right of the front course = fly left**; **0 unless `locstatus >= 4`** |
+| `locddm` | DDM ×1000 | measured DDM, not clamped |
+| `locsdm` | ×100 | sum of depths, nominal 40 |
+| `locsnr` | dB | tone SNR |
+| `locfreqactive` | kHz | tuned localizer channel; 0 = none |
+
+On a localizer channel every `vor*` field is 0, so a v2.2 consumer shows OFF,
+never a radial. **Do not draw a deviation bar unless `locstatus >= 4`**: noise
+decodes as a centred needle, and a killed daemon leaves its last values on the
+bridge. Supplemental equipment, not approach guidance; a back course reads
+reversed and the receiver cannot know. Glide slope, markers and DME are not
+supported. Accuracy, validity and the noise-only result are measured in
+[`docs/loc-sweep.md`](docs/loc-sweep.md) on synthetic signals only.
 
 ---
 

@@ -43,7 +43,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from rbvor.freqrules import channel_khz, is_vor_frequency  # noqa: E402
+from rbvor.freqrules import channel_khz, is_loc_frequency, is_vor_frequency  # noqa: E402
 from rbvor.record import IQMeta, IQWriter, default_basename  # noqa: E402
 
 DEFAULT_FS = 1_024_000
@@ -75,7 +75,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--backend", choices=["auto", "soapy", "pyrtlsdr", "rtl_sdr"],
                    default="auto")
     p.add_argument("--allow-non-vor", action="store_true",
-                   help="capture a localiser or off-grid channel anyway")
+                   help="capture an off-grid or out-of-band channel anyway "
+                        "(localizer channels are accepted without it since A33)")
     # sidecar context -- cheap to type, priceless three months later
     p.add_argument("--site", default="")
     p.add_argument("--station", default="")
@@ -242,6 +243,8 @@ def main(argv=None) -> int:
     args = parse_args(argv)
 
     ok, reason = is_vor_frequency(args.freq)
+    if not ok and is_loc_frequency(args.freq)[0]:
+        ok, reason = is_loc_frequency(args.freq)       # A33: decodable now
     print(f"channel check: {reason}")
     if not ok and not args.allow_non_vor:
         print("refusing to capture; pass --allow-non-vor to override", file=sys.stderr)

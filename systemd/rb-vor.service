@@ -14,8 +14,8 @@ Wants=network-online.target
 [Service]
 Type=notify
 NotifyAccess=main
-ExecStart=/usr/bin/python3 -m rbvor --config /etc/rb-vor/rb-vor.json
-WorkingDirectory=/opt/rb-vor
+ExecStart=/usr/bin/python3 -m rbvor --config /boot/firmware/rb/rb-vor.json
+WorkingDirectory=/opt/addons/rb-vor
 Environment=PYTHONUNBUFFERED=1
 User=rb-vor
 Group=rb-vor

@@ -769,6 +769,200 @@ Verified on a replica, not yet on a GitHub runner: Python 3.11.18, a fresh venv
 from `requirements.txt`, a `git archive` of HEAD plus these files, and CI's exact
 commands. Ruff clean, 604 passed, and 604 again pinned to two CPUs.
 
+### A33 — ILS localizer, phase A: channel rules, mode, wire v2.3, VOR untouched (2026-11-10)
+Brief: `docs/loc-plan.md` (L0–L6). Localizer decoding is in, **shipped
+disabled** (`loc.enabled: false`, pinned by
+`tests/test_loc_controller.py::test_shipped_config_has_the_localizer_disabled`)
+until a real localizer has been decoded (L7, O23).
+
+**L0 baseline — the plan's figures were stale.** The plan (and D5/D6) quote
+the real capture `capture_20260413T195020Z_109400.cu8` as Δφ 135.467°, AM
+0.271, SNR 38.2 dB. Run before any change, `vor_replay.py` gives **135.220°,
+0.260, 38.1 dB**. The plan's figures reproduce to the digit only with the
+pre-A25 filters (`channel_lp_hz` 12000, `channel_taps` 255, `sub_taps` 127),
+so they date from before A25 and nobody updated them. The baseline used
+instead: a SHA-256 over every field of every observation of the real capture
+under four DSP settings (default, pre-A25, 2 s windows, harmonic) plus a
+synthetic run, taken before any edit and again at the end — **identical**;
+the `vor_replay.py` text output is also byte-identical. Suite at L0: 604
+collected, 604 passed; ruff clean.
+
+**Channel rules (L1).** `is_loc_frequency()` and `loc_channels()` (40
+channels, 108.10–111.95, checked against a list written out as text in
+`tests/test_loc_freqrules.py`). The denylist trap the plan named was real:
+`classify()` returned `LOC` for a denylisted VOR channel, so once LOC is
+decodable a denied 109.4 would have been tuned as a localizer. New
+`NavaidClass.DENIED`, returned by a new `classify_navaid()`. **Deviation from
+the plan:** `classify()` itself still returns `LOC` for a denied channel,
+because `tests/test_freqrules.py` pins that and the brief requires existing
+tests unmodified; it is now a thin wrapper that folds DENIED into LOC, and
+everything that may tune a localizer uses `classify_navaid()`.
+`is_vor_frequency()` returns the same booleans as before; its reason for a
+denied channel no longer claims "odd 100 kHz digit".
+
+**Mode.** The mode is fixed per tuned channel at retune; only the tuned
+mode's demodulator runs. States are reused; A16 (repeat = no-op), `_flush()`
+across a VOR↔LOC change, `vorfreq` 0 releasing the dongle, NO_SDR (A30) and
+the read on connect (A31) each have a LOC test. LOC needs no bearing
+calibration.
+
+**Wire (RB-VOR-IF v2.3, `docs/RB-VOR-IF-v2.3.md`).** Six `loc*` fields as
+plan §6. **Deviation from the plan:** they are on the wire **only when
+`loc.enabled`** — then on every payload, zeros on a VOR channel. Without it
+the payload is v2.2's six keys exactly. Reason: `tests/test_bridge_io.py`
+asserts the payload is exactly the six v2.2 keys, and a disabled feature
+should not change the wire. The `vor*` and `loc*` halves go in one POST.
+
+**Clean stop.** With `loc.enabled`, `Controller.shutdown()` publishes an idle
+payload and `HttpTransport.drain()` waits for it before the session closes.
+Disabled, nothing new is published (VOR behaviour unchanged). A killed daemon
+is not covered (O25).
+
+**Found writing the spec:** v2.2 §3.3 and §4.1 still describe the radial, SNR
+and AM depth being forced to 0 without a valid bearing. The code has not done
+that since 1.0.0 (A26). v2.3 states the A26 behaviour; v2.2 is left as
+written because `tests/test_packaging.py` pins its text.
+
+**Logs.** `SolutionLogger` appends to an existing file without reading its
+header (it writes one only to a new or empty file — pinned by
+`test_solution_logger_never_rewrites_an_existing_header`), so new columns in
+`SOLUTION_SCHEMA` would have misaligned every row of an existing `vor.csv`.
+The localizer has its own schema (`LOC_SOLUTION_SCHEMA`) and file
+(`loc.solution_csv`, default `loc.csv` beside `log.solution_csv`); `--csv`
+gains a `<name>-loc.csv` twin.
+
+**Config.** Optional `loc` block, defaults in `config.LOC_DEFAULTS` (the
+A25-style exception to "no default in code", for the boot-partition config).
+**ICAO figures.** Plan §5 was written from memory. Checked against the only
+text reachable, a scan of Annex 10 Vol I as amended to No. 74 (pages dated
+4/11/99): band 108–111.975 MHz (3.1.3.2.1), 20 % per tone, 18–22 % (3.1.3.5.1–2),
+tones ±2.5 / 1.5 / 1 % for Cat I / II / III (3.1.3.5.3), phase lock 20° Cat
+I/II (3.1.3.5.3.3), 150 Hz predominating on the right facing the localizer
+from the approach end (3.1.3.1.2), ident 1020 ± 50 Hz at 5–15 % (3.1.3.9.2),
+two carriers 5–14 kHz apart and symmetric (3.1.3.2.1), course sector bounded
+by DDM 0.155 (3.1.1) — all as the plan had them. Two things the plan did not
+have: **SDM may legally be 30–60 % in coverage** (3.1.3.5.3.6.1), which
+decided D9, and a single carrier may be 0.005 % off (5.6 kHz at 111.95 MHz).
+Not verified: the odd-tenth channel plan (Vol V) and 0.155 as indicator full
+scale (airborne convention). Later amendments not checked. O26.
+
+**Roastbeef.** `../roastbeef/test/integration/test_vor_radio.py`, run
+unmodified against this tree: 60 checks, 59 pass. The failure, "and played"
+(rb-sdr-radio's playback file `heard.raw`), fails identically with
+`RB_VOR` pointed at a `git archive` of HEAD, so it predates this work and is
+not on rb-vor's side.
+
+`tools/vor_gen.py` gained `add_channel_noise()` and a `gen=` argument to
+`_autolevel()` so `loc_gen.py` reuses them; arithmetic and rng order
+unchanged (synthetic fingerprint identical), `VorParams`/`generate_blocks`
+unchanged.
+
+### A34 — the localizer tones are found by search, not read from a bin (2026-11-10, L3)
+Plan 4.2 measured (`docs/loc-sweep.md`, "Tone-frequency tolerance"; 1 s Hann
+window, true DDM +0.100). A **fixed** bin at 90/150 Hz reads, noiseless:
+
+| tone offset | fixed-bin DDM read | search | band power |
+|---|---|---|---|
+| ±1 % (inside even Cat III) | **−0.044** (wrong side) | +0.1001 | +0.1001 |
+| ±2 % | −0.007 | +0.1001 | +0.1001 |
+| ±2.5 % (Cat I limit) | −0.003 (a centred needle) | +0.1001 | +0.1001 |
+
+The plan expected a "grossly wrong" DDM; the measurement is worse than that:
+at 1 % the 150 Hz tone loses more than the 90 Hz one and the needle points
+the **wrong way**. (`test_a_fixed_bin_points_the_needle_wrong_on_a_lawful_station`;
+its first version asserted "near 0" and failed, which is how the sign was
+found.) The two candidates of the plan both hold across ±3 %: noiseless
+error ≤ 1e-4; at 10 dB, RMS 0.0120–0.0136 (search) vs 0.0124–0.0142 (band);
+at 3 dB 0.0475–0.0505 vs 0.0476–0.0510. **Search chosen:** marginally better
+at every point measured, and it reports the offset ε, which A37 uses as a
+validity cue. Grid ±3 % in 0.25 % steps, parabola, amplitudes read at the
+refined ε; `band` stays as `estimator: "band"` for comparison.
+
+### A35 — the localizer primes its carrier estimate after the channel filter fills (2026-11-10, L3)
+First smoke run: SDM read 0.402 for 0.400. Traced to a start-up transient,
+not a scale error: `VorDemod` primes the one-pole carrier estimate with the
+first output of a channel filter that starts from zeros, i.e. ~0, so the
+first windows read depths **×1.83** (tau 0.5 s; ×13 at tau 5 s), decaying
+over seconds. The VOR copes (the controller discards a window, quality warms
+up) and is not touched. `LocDemod` drops the first ⌈taps/decim⌉ channel
+samples and primes on the mean of the next 1/30 s: the first window then
+read SDM 0.4006 (measured before the gain correction below). Residual steady scale ×1.0010/×1.0009 = the 700 Hz / 255-tap
+envelope filter's gain at 90/150 Hz, divided out.
+
+### A36 — AFC and two-frequency localizers (2026-11-10, L4)
+Synthetic course + clearance carriers (Annex 10: 5–14 kHz apart, symmetric),
+DDM +0.0775, 20 dB (`docs/loc-sweep.md`, "Carrier offset"). The AFC settles
+on the **power-weighted mean** frequency, as its docstring predicts: clearance
+−10 dB at 8 kHz → +3492 Hz (course carrier at +4000). At 14 kHz it centres the
+course carrier exactly (+6999 Hz) and so pushes the clearance carrier out of
+the 13 kHz channel, which *reduced* the DDM error (−0.0055 → −0.0020). In
+every other case the DDM was identical with AFC on and off. The residual error
+is envelope capture between carriers, not AFC: −0.005 at clearance −10 dB,
+−0.019 at −3 dB, −0.041 at 0 dB; a clearance carrier 6 dB *stronger* with DDM
+0.30 dominates (reads +0.27). Single carrier at +4 / −5.5 kHz (the 0.005 %
+tolerance at 111.95 MHz is 5.6 kHz): DDM unchanged with AFC on or off. **AFC
+stays on in LOC mode; the 13 kHz channel filter is kept.** Real two-frequency
+behaviour is O24.
+
+### A37 — localizer validity: thresholds from the sweep, never from the DDM (2026-11-10, L4)
+Noise decodes as DDM ≈ 0 — a centred needle (plan 4.1). Measured on 1100
+cu8-quantised noise windows (5 levels × 4 seeds × 30 s): DDM +0.0016 mean,
+0.0075 std; SDM ≤ 0.034; tone SNR ≤ 11.2 dB; ε std 2 %.
+
+`LocQuality` judges tone SNR, SDM, steadiness of ε and the DDM's residual
+about a straight line, never the DDM value. Thresholds read off the error of
+the published DDM binned by the tone SNR the receiver measures (channel SNR
+−1…12 dB × 4 DDMs × 3 seeds):
+
+| tone SNR | pub RMS / max, % of full scale |
+|---|---|
+| 24–26 dB | 9.8 / 28.8 |
+| 26–28 dB | 7.8 / 21.2 |
+| 28–30 dB | 6.8 / 16.2 |
+| 30–32 dB | 4.6 / 11.2 |
+
+- `flag_snr_db` **26** (≈ 5 dB channel SNR): the worst valid window about one
+  dot (20 % FS) out. Noise maximum 11.2 dB: 15 dB margin.
+- `flag_sdm` **0.20**: a lawful station reads ≥ 0.30 when strong.
+- `flag_eps_std` **0.5 %**: a real signal's ε std over 5 windows is 0.014 %
+  mean / 0.021 % max at the SNR threshold. **Not a guarantee on its own:**
+  4 of 1100 noise windows passed it alone. Tone SNR and SDM each rejected all
+  1100 on their own.
+- Stability is the **detrended** residual: a plain std (the plan's wording)
+  would flag an intercept. Measured: DDM ramp −0.2 → +0.2 at 0.02/s, 33
+  windows judged, 0 flagged, no lag bias at the window centre (−0.0002).
+- Weights sdm 0.10 / snr 0.70 / stab 0.20, snr mapped 26–46 dB: put the
+  TRACKING/DEGRADED split at ≈ 29.5 dB tone SNR, where the RMS is ≈ 5 % FS.
+  **This is judgement on a binned table, not A11's correlation method**; the
+  terms are all driven by SNR on synthetic noise and a correlation would say
+  nothing more. O27.
+
+Result: 0 % flagged at ≥ 10 dB channel SNR, 28 % at 6 dB, 89 % at 3 dB,
+100 % at ≤ 0 dB. The state-machine test (six noise runs, 20 s each) never
+reaches `locstatus` ≥ 4 and `locdev` stays 0.
+
+### A38 — publish rate: hysteresis on the localizer fields (2026-11-10, L5)
+Every POST is also a flight-log row. Measured through the real Controller and
+Publisher, steady DDM +0.0775, keep-alive 5 s, POSTs per minute
+(`docs/loc-sweep.md`, "Publish rate"):
+
+| channel SNR | plain rounding | shipped | VOR for comparison |
+|---|---|---|---|
+| 30 dB | 112 | 15 | 55 |
+| 20 dB | 119 | 27 | 57 |
+| 10 dB | 119 | 81 | 57 |
+
+Shipped: `locdev` / `locddm` / `locsdm` / `locsnr` move only beyond a deadband
+of 2 / 4 / 2 / 4 wire units of the value last sent, reset on any status or
+channel change, so a shown `locdev` is at most 2 % FS (0.0031 DDM) from the
+measurement. Two defects found on the way, both by test: moving to `round(x)`
+when leaving the deadband overshot and **ping-ponged** between two values on
+a flicker just over half the deadband (fixed: move the least distance back
+into the deadband); and at 10 dB the TRACKING/DEGRADED split, where the score
+sits, flipped `locstatus` **23 times in ~64 s** — ±5 points of hysteresis on
+the split in LOC mode. At 10 dB 81/min remain: the 1 s DDM really moves by
+3 % FS there; more would need smoothing, which costs lag.
+
 ---
 
 ## Decisions (continued)
@@ -1008,6 +1202,36 @@ with `git status` and `git log`; nothing is edited on a tree whose relation to
 HEAD is unknown; the Pi is deployed from a commit, not from saved files. A
 tree that shows files *deleted* relative to HEAD is not "clean", it is stale.
 
+### D9 — localizer estimator, DDM form and window (2026-11-10, L4)
+**Estimator: tone search** (A34). **Window 1 s, hop 0.5 s, no smoothing**
+(`smooth_n` 1): DDM std at 10 dB is 4.4 / 3.2 / 2.7 / 2.4 % FS for windows of
+0.5 / 1 / 1.5 / 2 s; a window lags by half its length, and 0.5 s of lag was
+judged worth more on an approach than the 0.8 % FS a 2 s window saves.
+Overlapped windows make further smoothing cheap in noise and dear in lag.
+
+**DDM form (plan 4.3), measured, three candidates** (`docs/loc-sweep.md`):
+
+| channel SNR | raw m150−m90 RMS %FS | normalised 0.40·DDM/SDM | published |
+|---|---|---|---|
+| 20 dB | 1.5 | 1.2 | 1.2 |
+| 10 dB | 10.8 | 4.0 | 4.0 |
+| 6 dB | 25.2 | 6.7 | 6.7 |
+| 3 dB | 41.0 | 10.4 | 10.4 |
+
+The raw form under-reads by exactly the SDM compression (A8): at 10 dB it
+reads 87.5 % of the deviation, at 3 dB 51 % — the unsafe direction, as the
+plan feared. The normalised form removes it at every SNR, **but** on a
+lawful station whose SDM is not 0.40 it carries a scale error: the plan
+assumed 0.40; Annex 10 Vol I allows 18–22 % per tone on course (3.1.3.5.2)
+and an SDM of 30–60 % in coverage (3.1.3.5.3.6.1). Measured at full scale:
+SDM 0.36 → +10.7 % FS, 0.44 → −9.4 %, 0.60 → −33.5 %, 0.30 → +32.8 %.
+**Chosen: `DDM × max(1, 0.40 / SDM)`** — correct compression, never scale
+down. Identical to the normalised form whenever the measured SDM is below
+0.40 (every row above), raw when above: SDM 0.44 → −1.5 %, 0.60 → −1.6 %.
+The cost: a station transmitting less than 0.40 over-reads (0.36 → +10.7 %
+at full scale), i.e. errs towards *more* deviation. The SDM is published
+(`locsdm`) and the raw DDM logged, so either can be re-derived.
+
 ### D3 — Python confirmed against the A3 port gate (2026-07-24, M3)
 Full chain at 1.024 Msps measured at **6.5 % of one core** in this container
 (15.5× realtime), against the A3 threshold of 25 %. The gate stays open;
@@ -1141,8 +1365,8 @@ Also: `tests/conftest.py` now applies `_threadcaps` before numpy, because the
 suite itself was running at ~380 % CPU on four cores (A23 in miniature).
 
 ### F4 — the Pi deployment is not what `install.sh` builds
-`stderr.txt` shows `/opt/rb-vor/lib/python3.13/site-packages/rtlsdr/` and
-`vor_capture.sh` sources `/opt/rb-vor/bin/activate`: on the Pi, `/opt/rb-vor`
+`stderr.txt` shows `/opt/addons/rb-vor/lib/python3.13/site-packages/rtlsdr/` and
+`vor_capture.sh` sources `/opt/addons/rb-vor/bin/activate`: on the Pi, `/opt/addons/rb-vor`
 is a **venv** holding pyrtlsdr, and SoapySDR is absent. `install.sh` installs
 the source tree there and `python3-soapysdr` from apt, and
 `systemd/rb-vor.service` runs `/usr/bin/python3 -m rbvor`, which would not see
@@ -1219,6 +1443,11 @@ Causes, after the config was confirmed:
 | ~~Q1~~ | ~~`vorsignal` 0–100 or 0/1?~~ | ~~0–100 internally, `publish.signal_scale: "percent"`~~ **Moot since A20**: `vorsignal` is not on the wire; `signal_scale` is a dead key. |
 | Q2 | `vorradial` = radial FROM or bearing TO? | radial FROM, magnetic, `publish.bearing_ref: "from"` — still open (O4) |
 | ~~Q3~~ | ~~Publish periodic @1 Hz or on-change + keepalive?~~ | ~~`periodic`, 1.0 s~~ **Decided by A20**: always on-change, `keepalive_s` 5 s. |
+| Q4 | Are the `loc*` field names and the `locdev` sense of RB-VOR-IF v2.3 (+ = 150 Hz = fly left, % of full scale) what RB-01 should consume? | as written in v2.3 (A33) |
+| Q5 | Which ILS stations go in the plate's list, with which front courses? | none until read from the AIP |
+| Q6 | Is a ground capture near an ILS runway possible before the aircraft receiver is fixed, and where? | L7 waits (O23) |
+| Q7 | Licence for this repo (the `LICENSE` TODO)? | no GPL code ported; the localizer was written from Annex 10 and measurement |
+| Q8 | Phase B hides the VOR plate's deviation bar in VOR mode too: it was always drawn centred there (a constant 0, never a deviation), which looks like "on course". Keep it hidden? | hidden; the bar is drawn only for a localizer with `locstatus >= 4` |
 
 ## Open technical items
 

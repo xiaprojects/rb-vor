@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-. /opt/rb-vor/bin/activate
+. /opt/addons/rb-vor/bin/activate
 
 while sleep 1;do
 for FREQ in "114.4" "109.4" "111.8" "114.7" "115.2"; do

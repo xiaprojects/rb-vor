@@ -643,6 +643,127 @@
         "level",
         "solution_csv"
       ]
+    },
+    "loc": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A33-A37/D9: ILS localizer decoding. Optional: a config without it loads, and the localizer stays disabled. Defaults live in rbvor/config.py (LOC_DEFAULTS) so the config on the Pi's boot partition keeps loading after an upgrade.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "false: a localizer channel is rejected as before (INVALID_FREQ). Ships false until a real localizer has been decoded (plan L7)."
+        },
+        "integration_s": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 5,
+          "description": "window, whole 1/30 s; 1.0 chosen from the noise-against-lag sweep (docs/loc-sweep.md)"
+        },
+        "hop_s": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 5,
+          "description": "whole 1/30 s, <= integration_s"
+        },
+        "tone_search": {
+          "type": "number",
+          "minimum": 0.001,
+          "maximum": 0.05,
+          "description": "+/- fractional tone-frequency search; Cat I allows 0.025 (A34)"
+        },
+        "smooth_n": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "description": "moving average of the published DDM over this many windows; the raw value is judged (A15)"
+        },
+        "solution_csv": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "per-solution localizer log; default loc.csv beside log.solution_csv. A separate file because SolutionLogger appends to an existing file without checking its header (A37)"
+        },
+        "quality": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "A37: from the sweep, not from the plan",
+          "properties": {
+            "weights": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "sdm": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "snr": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "stab": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              },
+              "required": [
+                "sdm",
+                "snr",
+                "stab"
+              ]
+            },
+            "snr_lo_db": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 80
+            },
+            "snr_hi_db": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "stab_full_ddm": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 0.4
+            },
+            "flag_snr_db": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 80
+            },
+            "flag_sdm": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "flag_stab_threshold": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "flag_eps_std": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 0.05
+            },
+            "history": {
+              "type": "integer",
+              "minimum": 3,
+              "maximum": 50
+            },
+            "_note": {
+              "type": "string"
+            }
+          }
+        },
+        "_note": {
+          "type": "string"
+        }
+      }
     }
   }
 }

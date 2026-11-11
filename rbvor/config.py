@@ -26,9 +26,11 @@ from typing import Any
 
 from rbvor.bearing import BearingCal
 from rbvor.dsp import INTERMEDIATE_HZ, DspParams
+from rbvor.loc import LocDspParams, LocQualityParams
 from rbvor.quality import QualityParams
 
-__all__ = ["Config", "ConfigError", "load", "DEFAULT_PATHS", "SCHEMA_PATH"]
+__all__ = ["Config", "ConfigError", "load", "DEFAULT_PATHS", "SCHEMA_PATH",
+           "LocSettings", "LOC_DEFAULTS"]
 
 log = logging.getLogger("rbvor.config")
 
@@ -44,6 +46,32 @@ DEFAULT_PATHS = (
     Path("/etc/rb-vor/rb-vor.json"),
     _ROOT / "config" / "rb-vor.json",
 )
+
+
+#: AMENDMENT A33: the `loc` block is optional, so the defaults live here and
+#: not in the shipped file -- the one deliberate exception to rule 2 above,
+#: made for the same reason as the optional `dsp` keys of A25: a config on the
+#: Pi's boot partition, edited by hand and never regenerated, must keep loading
+#: after an upgrade (F6 shows what a config/schema mismatch does in the field).
+#: Quality figures are those of `LocQualityParams`, measured in A37.
+LOC_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "integration_s": 1.0,
+    "hop_s": 0.5,
+    "tone_search": 0.03,
+    "smooth_n": 1,
+}
+
+
+@dataclass(frozen=True)
+class LocSettings:
+    """Typed view of the optional `loc` block (A33)."""
+
+    enabled: bool
+    dsp: LocDspParams
+    quality: LocQualityParams
+    smooth_n: int
+    solution_csv: str | None
 
 
 class ConfigError(ValueError):
@@ -134,6 +162,29 @@ class Config:
     @property
     def calibrated(self) -> bool:
         return self.bearing.calibrated
+
+    @property
+    def loc(self) -> LocSettings:
+        """The localizer settings; disabled defaults when the block is absent."""
+        raw = self.raw.get("loc") or {}
+        v = {**LOC_DEFAULTS, **{k: raw[k] for k in LOC_DEFAULTS if k in raw}}
+        q = dict(raw.get("quality") or {})
+        q.pop("_note", None)
+        if "weights" in q:
+            q["weights"] = dict(q["weights"])
+        if "solution_csv" in raw:
+            csv_path = raw["solution_csv"] or None
+        else:
+            vor_csv = (self.raw.get("log") or {}).get("solution_csv")
+            csv_path = str(Path(vor_csv).with_name("loc.csv")) if vor_csv else None
+        return LocSettings(
+            enabled=bool(v["enabled"]),
+            dsp=LocDspParams.from_dsp(self.dsp, integration_s=v["integration_s"],
+                                      hop_s=v["hop_s"], tone_search=v["tone_search"]),
+            quality=LocQualityParams(**q),
+            smooth_n=int(v["smooth_n"]),
+            solution_csv=csv_path,
+        )
 
 
 def _validate_schema(data: dict) -> None:
@@ -238,7 +289,7 @@ def load(path: str | Path | None = None) -> Config:
     # QualityParams and BearingCal all enforce their own invariants.
     cfg = Config(raw=data, source=p)
     try:
-        _ = (cfg.dsp, cfg.bearing, cfg.quality)
+        _ = (cfg.dsp, cfg.bearing, cfg.quality, cfg.loc)
     except ValueError as e:
         raise ConfigError(f"{p}: {e}") from e
     return cfg

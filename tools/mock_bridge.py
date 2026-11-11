@@ -9,6 +9,10 @@ connections, HTTP 500s, and a slow endpoint.
 
     ./mock_bridge.py --script "109.4@0,113.35@8,null@16" --port 8099
     ./mock_bridge.py --fail-rate 0.3 --slow 1.5
+    ./mock_bridge.py --script "109.4@0,109.5@8,0@16"     # VOR, localizer, OFF
+
+Validates RB-VOR-IF v2.2 payloads, and v2.3 ones (the six loc* keys, sent when
+the receiver has loc.enabled). Like RB-01, OFF may be posted as 0.
 """
 
 from __future__ import annotations
@@ -83,11 +87,26 @@ async def update_handler(request: web.Request) -> web.Response:
     except Exception:
         return web.Response(status=400, text="not JSON")
 
+    problems = validate(body)
+    RECEIVED.append(body)
+    flag = "  <-- " + "; ".join(problems) if problems else ""
+    print(f"  [rest] {json.dumps(body)}{flag}")
+    return web.json_response({"ok": not problems})
+
+
+VOR_KEYS = {"vorradial", "vorsnr", "voram", "vorstatus", "vorsub", "vorfreqactive"}
+#: RB-VOR-IF v2.3 (CLAUDE.md A33): present, all six, exactly when the receiver
+#: has loc.enabled; absent otherwise.
+LOC_KEYS = {"locstatus", "locdev", "locddm", "locsdm", "locsnr", "locfreqactive"}
+
+
+def validate(body: dict) -> list[str]:
+    """Every deviation of one POST body from RB-VOR-IF v2.2 / v2.3 section 3."""
     problems = []
-    expect = {"vorradial", "vorsnr", "voram", "vorstatus", "vorsub", "vorfreqactive"}
+    expect = VOR_KEYS | LOC_KEYS if LOC_KEYS & set(body) else VOR_KEYS
     if set(body) != expect:
         problems.append(f"payload keys are {sorted(body)}, expected "
-                        f"{sorted(expect)} exactly")
+                        f"{sorted(expect)} exactly (v2.2 six, or v2.3 twelve)")
     for k in expect:
         if k in body and not isinstance(body[k], int):
             problems.append(f"{k} is {type(body[k]).__name__}, expected int")
@@ -105,11 +124,30 @@ async def update_handler(request: web.Request) -> web.Response:
             and not 108000 <= body["vorfreqactive"] <= 118000:
         problems.append(f"vorfreqactive {body['vorfreqactive']} not 0 or in "
                         "108000..118000 kHz (VOR airband)")
-
-    RECEIVED.append(body)
-    flag = "  <-- " + "; ".join(problems) if problems else ""
-    print(f"  [rest] {json.dumps(body)}{flag}")
-    return web.json_response({"ok": not problems})
+    for k in LOC_KEYS & set(body):
+        if not isinstance(body[k], int) or isinstance(body[k], bool):
+            problems.append(f"{k} is {type(body[k]).__name__}, expected int")
+    if not problems and set(body) >= LOC_KEYS:
+        ls, dev, lf = body["locstatus"], body["locdev"], body["locfreqactive"]
+        if ls not in range(6):
+            problems.append(f"locstatus {ls} not in 0..5")
+        if not -100 <= dev <= 100:
+            problems.append(f"locdev {dev} out of range -100..100")
+        if dev != 0 and ls < 4:
+            problems.append(f"locdev {dev} with locstatus {ls}: must be 0 unless usable")
+        if not 0 <= body["locsdm"] <= 100:
+            problems.append(f"locsdm {body['locsdm']} out of range 0..100")
+        if not 0 <= body["locsnr"] <= 120:
+            problems.append(f"locsnr {body['locsnr']} out of range 0..120 dB")
+        if lf != 0 and not (108100 <= lf <= 111950 and (lf // 100) % 2 == 1):
+            problems.append(f"locfreqactive {lf} not 0 or a localizer channel")
+        if lf and body["vorfreqactive"]:
+            problems.append("vorfreqactive and locfreqactive both non-zero: one mode at a time")
+        if lf and any(body[k] for k in VOR_KEYS):
+            problems.append("on a localizer channel every vor* field must be 0 (v2.3 3.8)")
+        if not lf and ls:
+            problems.append(f"locstatus {ls} with locfreqactive 0")
+    return problems
 
 
 async def dump_handler(request: web.Request) -> web.Response:

@@ -46,6 +46,40 @@ Schema `rb-vor.solution/1`.
 | `overrun` | bool | window touched a sample gap (discarded if true) |
 | `iq_ref` | filename | IQ capture that includes this window, if any |
 
+
+## Localizer records (A33)
+
+With `loc.enabled`, solutions on an ILS localizer channel go to a separate local CSV (`loc.solution_csv`, default `loc.csv` beside `log.solution_csv`) with their own schema, generated from `rbvor.solutionlog.LOC_SOLUTION_SCHEMA`. A separate file and schema because the solution logger appends to an existing file without reading its header, so adding columns to the VOR schema would have misaligned every row written after an upgrade. The privacy note below applies to it unchanged (`gps_track` is the only aircraft-state field).
+
+Schema `rb-vor.loc-solution/1`.
+
+| field | unit | description |
+|---|---|---|
+| `t_utc` | ISO-8601 | wall-clock time the solution was produced |
+| `t_mono` | s | monotonic time of the publish |
+| `channel_khz` | kHz | tuned localizer channel, integer |
+| `state` | enum | controller state: TRACKING/DEGRADED/NO_SIGNAL/... |
+| `locstatus` | 0-5 | published status code, >= 4 usable |
+| `ddm` | DDM | published DDM (smoothed, compression-corrected, D9), empty when not usable; + = 150 Hz predominates = fly left |
+| `valid` | bool | true when locstatus >= 4 |
+| `reason` | text | human-readable state/flag reason |
+| `q_sdm` | 0-1 | SDM quality term (SDM / 0.40) |
+| `q_snr` | 0-1 | tone SNR quality term |
+| `q_stab` | 0-1 | DDM steadiness about its trend |
+| `value` | 0-100 | internal localizer quality score; 0 = flagged |
+| `m90` | frac | 90 Hz depth, nominal 0.20 |
+| `m150` | frac | 150 Hz depth, nominal 0.20 |
+| `ddm_raw` | DDM | m150 - m90 of the last window, before correction |
+| `ddm_corrected` | DDM | raw DDM x max(1, 0.40 / SDM), before smoothing |
+| `sdm` | frac | m90 + m150, nominal 0.40 |
+| `snr_db` | dB | mean tone amplitude against the off-tone bins |
+| `tone_offset` | frac | found fractional tone-frequency offset (A34) |
+| `carrier` | a.u. | smoothed carrier magnitude |
+| `carrier_offset_hz` | Hz | carrier offset from the nominal down-mix (A25) |
+| `gps_track` | deg true | aircraft track from the bridge, diagnostics only |
+| `overrun` | bool | window touched a sample gap |
+| `iq_ref` | filename | IQ capture that includes this window, if any |
+
 ## IQ captures
 
 When `record.trigger` is `on_flag`, the IQ that produced a NAV flag is written

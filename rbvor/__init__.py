@@ -5,4 +5,4 @@ Supplemental / non-required equipment. Not for IFR navigation.
 """
 
 __version__ = "0.9.0"
-IF_VERSION = "RB-VOR-IF v2.2"
+IF_VERSION = "RB-VOR-IF v2.3"

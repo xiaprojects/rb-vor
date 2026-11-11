@@ -2,8 +2,8 @@
   "$schema": "./schema/rb-vor.schema.json",
   "version": "1.0",
   "bridge": {
-    "ws_url": "ws://192.168.10.1/bridge/float/ws",
-    "rest_url": "http://192.168.10.1/bridge/float",
+    "ws_url": "ws://localhost/bridge/float/ws",
+    "rest_url": "http://localhost/bridge/float",
     "ws_reconnect_min_s": 0.5,
     "ws_reconnect_max_s": 30.0,
     "ws_grace_s": 5.0,
@@ -98,13 +98,17 @@
   },
   "record": {
     "enabled": false,
-    "dir": "/var/lib/rb-vor/iq",
+    "dir": "/var/log/rb-vor",
     "format": "cu8",
     "max_seconds": 30,
     "trigger": "on_flag"
   },
   "log": {
     "level": "INFO",
-    "solution_csv": "/var/log/rb-vor/solutions.csv"
+    "solution_csv": "/var/log/rb-vor/vor.csv"
+  },
+  "loc": {
+    "enabled": true,
+    "_note": "ILS localizer (CLAUDE.md A33-A37, D9; RB-VOR-IF v2.3). Off until a real localizer has been decoded (docs/loc-plan.md L7). Every other loc key is optional with defaults in rbvor/config.py LOC_DEFAULTS."
   }
 }

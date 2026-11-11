@@ -6,15 +6,15 @@
 #
 #     sudo ./install.sh
 #
-# Installs to /opt/rb-vor, config to /etc/rb-vor, and a systemd unit running as
+# Installs to /opt/addons/rb-vor, config to /etc/rb-vor, and a systemd unit running as
 # an unprivileged dedicated user. The daemon never needs root at runtime.
 #
 #     ./install.sh --uninstall     remove everything except captures and logs
 #     ./install.sh --no-service    files only, no systemd
 set -euo pipefail
 
-PREFIX=/opt/rb-vor
-CONFDIR=/etc/rb-vor
+PREFIX=/opt/addons/rb-vor
+CONFDIR=/boot/firmware/rb/rb-vor.json
 USER_NAME=rb-vor
 UNIT=rb-vor.service
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,7 +38,7 @@ die()  { printf '\033[31m    error: %s\033[0m\n' "$*" >&2; exit 1; }
 if [ "${UNINSTALL:-0}" = 1 ]; then
   say "Uninstalling"
   systemctl disable --now "$UNIT" 2>/dev/null || true
-  rm -f "/etc/systemd/system/$UNIT" /etc/udev/rules.d/99-rb-vor-sdr.rules \
+  rm -f "/lib/systemd/system/$UNIT" /etc/udev/rules.d/99-rb-vor-sdr.rules \
         /etc/modprobe.d/rb-vor-blacklist.conf
   rm -rf "$PREFIX"
   systemctl daemon-reload
@@ -142,7 +142,7 @@ print('    calibrated:', cfg.calibrated)
 # --------------------------------------------------------------------------- #
 if [ "$DO_SERVICE" = 1 ]; then
   say "Installing the systemd unit"
-  install -m 0644 "$SRC/systemd/$UNIT" /etc/systemd/system/
+  install -m 0644 "$SRC/systemd/$UNIT" /lib/systemd/system/
   systemctl daemon-reload
   systemctl enable "$UNIT"
   echo "    enabled (not started -- see below)"
@@ -165,7 +165,7 @@ if [ "$CALIBRATED" = "no" ]; then
 
     Measure it, then start the service:
 
-        cd /opt/rb-vor
+        cd /opt/addons/rb-vor
         python3 tools/vor_calibrate.py --json /tmp/bearing.json
         # merge the "bearing" block into /etc/rb-vor/rb-vor.json
         sudo systemctl start rb-vor

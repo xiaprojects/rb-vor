@@ -20,6 +20,14 @@ R3  108.000-111.950: VOR only if the 100 kHz digit is EVEN.
 R4  112.000-117.950: every 50 kHz channel is a VOR channel
 R5  optional allowlist / denylist for regional exceptions and test channels
 
+ILS localizer channels (AMENDMENT A33, 2026-11-10): the R3 channels that are
+not VOR -- 108.10-111.95 MHz with an odd 100 kHz digit, 40 channels on the
+50 kHz grid -- are localizers. `is_loc_frequency()` accepts them, and
+`is_vor_frequency()` keeps rejecting them exactly as before. Annex 10 Vol I
+3.1.3.2.1 puts localizers in 108-111.975 MHz (checked against the Amendment 74
+text); the odd-tenth channel plan itself is from Annex 10 Vol V and was not
+checked against that document.
+
 Note on R3/R4: a handful of channels (e.g. 108.000-108.050) are reserved or
 unassigned in some regions despite satisfying the even-digit rule. That is a
 regional assignment matter, not a channelling rule -- handle it with the R5
@@ -41,8 +49,11 @@ __all__ = [
     "LOC_SPLIT_KHZ",
     "channel_khz",
     "classify",
+    "classify_navaid",
     "is_vor_frequency",
+    "is_loc_frequency",
     "vor_channels",
+    "loc_channels",
 ]
 
 BAND_MIN_KHZ: int = 108_000
@@ -62,6 +73,11 @@ class NavaidClass(StrEnum):
     OFF_GRID = "OFF_GRID"
     OUT_OF_BAND = "OUT_OF_BAND"
     INVALID = "INVALID"
+    #: A33: on the operator's denylist (R5). Distinct from LOC since a LOC
+    #: channel can be decoded: a denied VOR channel reported as LOC would be
+    #: tuned as a localizer. Only `classify_navaid()` returns it; `classify()`
+    #: keeps its published behaviour and reports a denied channel as LOC.
+    DENIED = "DENIED"
 
 
 def _to_khz(mhz: object) -> int | None:
@@ -122,7 +138,7 @@ def _normalise_list(values: Iterable[object] | None) -> frozenset:
     return frozenset(out)
 
 
-def classify(
+def classify_navaid(
     mhz: object,
     *,
     allowlist_mhz: Sequence[object] | None = None,
@@ -132,7 +148,12 @@ def classify(
     grid_khz: int = GRID_KHZ,
     tolerance_khz: int = SNAP_TOLERANCE_KHZ,
 ) -> NavaidClass:
-    """Classify a frequency in MHz. See module docstring for rules R1-R5."""
+    """Classify a frequency in MHz, with `NavaidClass.DENIED` for R5 (A33).
+
+    This is the classification the receiver acts on. `classify()` is the same
+    function with DENIED folded into LOC, as it was published before
+    localizers could be decoded.
+    """
     raw = _to_khz(mhz)
     if raw is None:
         return NavaidClass.INVALID
@@ -159,7 +180,7 @@ def classify(
 
     # R5 -- applied last, so an operator can force a channel either way.
     if channel in _normalise_list(denylist_mhz):
-        return NavaidClass.LOC
+        return NavaidClass.DENIED
     if channel in _normalise_list(allowlist_mhz):
         return NavaidClass.VOR
 
@@ -170,6 +191,22 @@ def classify(
     # R3
     hundreds_digit = (channel % 1000) // 100
     return NavaidClass.VOR if hundreds_digit % 2 == 0 else NavaidClass.LOC
+
+
+def classify(mhz: object, **kwargs) -> NavaidClass:
+    """Classify a frequency in MHz. See module docstring for rules R1-R5.
+
+    Published primitive, behaviour unchanged since before A33: a denylisted
+    channel is reported as `NavaidClass.LOC` ("not a VOR"). Code that may
+    decode a localizer must use `classify_navaid()`, which tells the two apart.
+    """
+    cls = classify_navaid(mhz, **kwargs)
+    return NavaidClass.LOC if cls is NavaidClass.DENIED else cls
+
+
+def _mhz_text(mhz: object) -> str:
+    ch = channel_khz(mhz)
+    return f"{ch / 1000.0:.3f}" if ch is not None else f"{mhz}"
 
 
 def is_vor_frequency(mhz: object, **kwargs) -> tuple[bool, str]:
@@ -183,9 +220,13 @@ def is_vor_frequency(mhz: object, **kwargs) -> tuple[bool, str]:
     >>> is_vor_frequency(109.5)[0]
     False
     """
-    cls = classify(mhz, **kwargs)
+    cls = classify_navaid(mhz, **kwargs)
     if cls is NavaidClass.VOR:
         return True, f"VOR channel {channel_khz(mhz) / 1000.0:.3f} MHz"
+    if cls is NavaidClass.DENIED:
+        # A33: used to say "ILS localiser channel (odd 100 kHz digit)" even for
+        # an even-digit VOR channel the operator had denied.
+        return False, f"{_mhz_text(mhz)} MHz is on the frequency denylist"
     if cls is NavaidClass.LOC:
         return False, (
             f"{channel_khz(mhz) / 1000.0:.3f} MHz is an ILS localiser channel "
@@ -199,6 +240,37 @@ def is_vor_frequency(mhz: object, **kwargs) -> tuple[bool, str]:
             f"{BAND_MIN_KHZ / 1000.0:.3f}-{BAND_MAX_KHZ / 1000.0:.3f} MHz"
         )
     return False, f"{mhz!r} is not a usable frequency value"
+
+
+def is_loc_frequency(mhz: object, **kwargs) -> tuple[bool, str]:
+    """Return ``(valid, reason)``: is this an ILS localizer channel? (A33)
+
+    Same rules and keyword arguments as `is_vor_frequency()`. A denylisted
+    channel is not a localizer, and an allowlisted odd-digit channel is a VOR
+    (the operator forced it), so neither is accepted here.
+
+    >>> is_loc_frequency(109.5)
+    (True, 'ILS localizer channel 109.500 MHz')
+    >>> is_loc_frequency(109.4)[0]
+    False
+    """
+    cls = classify_navaid(mhz, **kwargs)
+    if cls is NavaidClass.LOC:
+        return True, f"ILS localizer channel {channel_khz(mhz) / 1000.0:.3f} MHz"
+    if cls is NavaidClass.VOR:
+        return False, f"{_mhz_text(mhz)} MHz is a VOR channel, not a localizer"
+    if cls is NavaidClass.DENIED:
+        return False, f"{_mhz_text(mhz)} MHz is on the frequency denylist"
+    return is_vor_frequency(mhz, **kwargs)        # off-grid / out of band / junk
+
+
+def loc_channels(**kwargs) -> list[int]:
+    """All ILS localizer channels in the band, in kHz (40 with no lists)."""
+    return [
+        ch
+        for ch in range(BAND_MIN_KHZ, BAND_MAX_KHZ + 1, GRID_KHZ)
+        if classify_navaid(ch / 1000.0, **kwargs) is NavaidClass.LOC
+    ]
 
 
 def vor_channels(**kwargs) -> list[int]:

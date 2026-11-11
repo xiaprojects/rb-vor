@@ -82,10 +82,22 @@ async def _run(cfg, args) -> int:
     # 1.0.0: raw per-window decode dump (--csv), the live counterpart of what
     # vor_replay.py writes off a capture, with the tuned channel per row.
     obs_sink = None
+    loc_obs_sink = None
+    loc_on = cfg.loc.enabled
     if args.csv:
-        from rbvor.obscsv import ObsCsvSink
+        from rbvor.obscsv import LocObsCsvSink, ObsCsvSink, loc_path_for
         obs_sink = ObsCsvSink(args.csv)
         print(f"  dumping per-window decode to {args.csv}", flush=True)
+        if loc_on:
+            loc_obs_sink = LocObsCsvSink(loc_path_for(args.csv))
+            print(f"  localizer windows to {loc_obs_sink.path}", flush=True)
+
+    # A33: the localizer has its own solution log (a different schema; see
+    # rbvor/solutionlog.py for why it cannot share the VOR file).
+    loc_logger = None
+    if loc_on:
+        from rbvor.solutionlog import LOC_FIELDS
+        loc_logger = SolutionLogger(cfg.loc.solution_csv, fields=LOC_FIELDS)
 
     # The bridge client is only started when the channel actually comes from the
     # bridge. Bench mode (--freq) and replay both supply the channel themselves,
@@ -100,7 +112,9 @@ async def _run(cfg, args) -> int:
                             solution_sink=sol_logger.write,
                             obs_sink=obs_sink,
                             sdr_retry_s=(cfg.sdr.get("retry_s", 5.0)
-                                         if channel_from_bridge else None))
+                                         if channel_from_bridge else None),
+                            loc_solution_sink=loc_logger.write if loc_logger else None,
+                            loc_obs_sink=loc_obs_sink)
 
     if not cfg.calibrated:
         log.warning("bearing calibration is not set: NO bearing will be published. "
@@ -168,6 +182,8 @@ async def _run(cfg, args) -> int:
           f"offset {cfg.sdr['tuner_offset_hz']:+d} Hz", flush=True)
     print(f"  calibrated  {'YES' if cfg.calibrated else 'NO -- will publish flags only'}",
           flush=True)
+    loc_txt = "ENABLED (supplemental, not approach guidance)" if loc_on else "disabled"
+    print(f"  localizer   {loc_txt}", flush=True)
     print(f"  mode        {'replay' if args.replay else ('bench' if args.freq else 'bridge')}"
           f"{'  (dry-run)' if args.dry_run else ''}", flush=True)
     if _threadcaps._CHANGED:
@@ -177,6 +193,15 @@ async def _run(cfg, args) -> int:
 
     def _status_line() -> str:
         c = controller
+        if c.mode == "loc":
+            lq, lo = c._last_loc_q, c._last_loc_obs
+            ch = f"{c.channel_khz/1000:.3f}" if c.channel_khz else "-----"
+            dev = (f"{c._loc_ddm:+.4f}" if c._loc_ddm is not None
+                   and c.state in ("TRACKING", "DEGRADED") else "  ---  ")
+            meas = (f"sdm {lo.sdm:.3f} snr {lo.snr_db:4.1f} dB eps {100*lo.tone_offset:+.2f}%"
+                    if lo is not None else "sdm -- snr -- eps --")
+            return (f"[{c.state:11s}] {ch} MHz  LOC ddm {dev}  sig "
+                    f"{lq.value if lq else 0:3d}  {meas}")
         q = c._last_q
         bearing = ("---" if c._last_good is None or c.state in
                    ("IDLE", "TUNING", "INVALID_FREQ") else f"{c._last_good:3d}\u00b0")
@@ -257,10 +282,23 @@ async def _run(cfg, args) -> int:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        # A33: with the localizer enabled the last payload is idle (locstatus
+        # 0), so a clean stop never leaves a usable status and a centred needle
+        # on a bridge that has no staleness timeout.
+        try:
+            controller.shutdown()
+        except Exception as e:                       # noqa: BLE001
+            log.warning("idle publish at shutdown failed: %s", e)
+        if isinstance(transport, HttpTransport):
+            await transport.drain(1.0)
         if live:
             sdr.close()
             log.info("sdr final %s", sdr.stats)
         sol_logger.close()
+        if loc_logger is not None:
+            loc_logger.close()
+        if loc_obs_sink is not None:
+            loc_obs_sink.close()
         if obs_sink is not None:
             obs_sink.close()
             log.info("wrote %d rows to %s", obs_sink.rows, args.csv)

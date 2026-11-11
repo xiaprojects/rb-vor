@@ -55,7 +55,7 @@ def run_self_test(config_path: Path | None = None) -> int:
     from rbvor import dsp as dsp_mod
     from rbvor.bearing import BearingCal, BearingTracker, angular_difference
     from rbvor.dsp import DspParams, VorDemod
-    from rbvor.freqrules import classify, is_vor_frequency
+    from rbvor.freqrules import classify, is_loc_frequency, is_vor_frequency
     from rbvor.publisher import PublishPolicy
     from rbvor.quality import QualityEstimator, QualityParams
     from tools import vor_gen as gen_mod
@@ -77,13 +77,15 @@ def run_self_test(config_path: Path | None = None) -> int:
           f"vor_gen {gen_conv} vs dsp {dsp_conv} -- MIXED VERSIONS on disk: "
           "sync the whole tree, not single files")
 
-    # 1 -- channel rules
+    # 1 -- channel rules. 109.5 is a localizer channel either way; whether the
+    # daemon decodes it or rejects it follows loc.enabled (A33), reported once
+    # the config is read, below.
     ok_vor = is_vor_frequency(109.4)[0]
-    ok_loc = not is_vor_frequency(109.5)[0]
+    ok_loc = not is_vor_frequency(109.5)[0] and is_loc_frequency(109.5)[0]
     ok_band = str(classify(118.0)) == "OUT_OF_BAND"
     r.add("channel rules (109.4 / 109.5 / 118.0)",
           PASS if (ok_vor and ok_loc and ok_band) else FAIL,
-          "109.4 VOR, 109.5 localiser, 118.0 out of band")
+          "109.4 VOR, 109.5 localizer, 118.0 out of band")
 
     # 2 -- configuration
     #
@@ -132,6 +134,11 @@ def run_self_test(config_path: Path | None = None) -> int:
                       "Run tools/vor_calibrate.py")
     except Exception as e:                           # noqa: BLE001
         r.add("configuration", FAIL, str(e)[:80])
+    loc_on = bool(cfg is not None and cfg.loc.enabled)
+    r.add("localizer channels (A33)", PASS,
+          "109.5 will be DECODED (loc.enabled true; supplemental, not approach "
+          "guidance)" if loc_on else
+          "109.5 will be rejected as INVALID_FREQ (loc.enabled false, the shipped default)")
 
     # 3 -- synthetic signal, full chain
     t0 = time.perf_counter()
@@ -201,12 +208,44 @@ def run_self_test(config_path: Path | None = None) -> int:
                         {"keepalive_s": 5.0, "hold_s": 3.0, "bearing_ref": "from"})
     payload = pol.decide(137, 53.0, 0.30, state="TRACKING", valid=True,
                          status=5, sub_level=0.29, freq_khz=109_400).payload
+    # v2.3 adds the loc* keys only with loc.enabled; without it the payload
+    # is exactly the v2.2 six
     shape_ok = (set(payload) == {"vorradial", "vorsnr", "voram",
                                  "vorstatus", "vorsub", "vorfreqactive"}
                 and all(isinstance(v, int) for v in payload.values())
                 and payload["vorstatus"] == 5 and payload["vorfreqactive"] == 109_400)
+    from rbvor.publisher import LOC_KEYS, LocWire
+    pol2 = PublishPolicy({"keepalive_s": 0, "hold_s": 3.0, "bearing_ref": "from"})
+    p23 = pol2.decide(None, state="TRACKING", status=0,
+                      loc=LocWire(status=5, ddm=0.0775, sdm=0.40, snr_db=40.0,
+                                  freq_khz=109_500, usable=True)).payload
+    shape_ok = shape_ok and (set(p23) == set(payload) | set(LOC_KEYS)
+                             and p23["locdev"] == 50 and p23["vorstatus"] == 0)
     r.add(f"publish payload conforms to {IF_VERSION}",
-          PASS if shape_ok else FAIL, str(payload))
+          PASS if shape_ok else FAIL,
+          f"{payload}; with loc.enabled +{len(LOC_KEYS)} loc* keys")
+
+    # 6b -- localizer chain (A33), run whether or not it is enabled: it proves
+    # the software, like every other stage here.
+    from rbvor.loc import LocDemod, LocDspParams, LocQuality
+    from tools.loc_gen import LocParams
+    from tools.loc_gen import generate_blocks as loc_blocks
+    lp = LocParams(ddm=0.0775, tone_offset=0.02, fs=FS, offset_hz=-FS // 4,
+                   seconds=6.0, snr_db=25.0, block=1 << 16)
+    ld = LocDemod(LocDspParams(fs=FS, offset_hz=-FS // 4))
+    lobs = [x for b in loc_blocks(lp) for x in ld.push(b)][3:]
+    lq = LocQuality()
+    lres = [lq.update(x, x.ddm_corrected) for x in lobs]
+    lerr = max((abs(x.ddm_corrected - 0.0775) for x in lobs), default=1.0)
+    r.add("localizer DDM (half scale, tones +2 %)",
+          PASS if lobs and lerr < 0.01 and not lres[-1].flagged else FAIL,
+          f"max error {lerr:.4f} DDM over {len(lobs)} windows (expected < 0.01)")
+    ld2 = LocDemod(LocDspParams(fs=FS, offset_hz=-FS // 4))
+    lq2 = LocQuality()
+    lnoise = [lq2.update(x, x.ddm_corrected) for x in ld2.push(noise)]
+    r.add("localizer invalid on noise only (plan 4.1)",
+          PASS if lnoise and all(v.flagged for v in lnoise) else FAIL,
+          f"{sum(v.flagged for v in lnoise)}/{len(lnoise)} windows flagged")
 
     # 7 -- performance
     pct = 100.0 * dsp_s / signal_s * (FS / 1_024_000)
