@@ -43,7 +43,12 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from rbvor.freqrules import channel_khz, is_loc_frequency, is_vor_frequency  # noqa: E402
+from rbvor.freqrules import (  # noqa: E402
+    channel_khz,
+    gs_channels,
+    is_loc_frequency,
+    is_vor_frequency,
+)
 from rbvor.record import IQMeta, IQWriter, default_basename  # noqa: E402
 
 DEFAULT_FS = 1_024_000
@@ -245,11 +250,16 @@ def main(argv=None) -> int:
     ok, reason = is_vor_frequency(args.freq)
     if not ok and is_loc_frequency(args.freq)[0]:
         ok, reason = is_loc_frequency(args.freq)       # A33: decodable now
+    gs_khz = int(round(args.freq * 1000))
+    if not ok and gs_khz in gs_channels():
+        # A39-A44: a glide-path channel; vor_replay.py picks the glide-slope
+        # decoder from this sidecar frequency
+        ok, reason = True, f"ILS glide-path channel {gs_khz / 1000:.3f} MHz"
     print(f"channel check: {reason}")
     if not ok and not args.allow_non_vor:
         print("refusing to capture; pass --allow-non-vor to override", file=sys.stderr)
         return 2
-    ch = channel_khz(args.freq)
+    ch = gs_khz if gs_khz in gs_channels() else channel_khz(args.freq)
     nav = (ch * 1000) if ch else int(round(args.freq * 1e6))
     offset = args.offset if args.offset is not None else -args.fs // 4
     center = nav + offset

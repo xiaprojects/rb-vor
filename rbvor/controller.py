@@ -51,6 +51,7 @@ consumer reads.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Callable
 from datetime import UTC
@@ -64,7 +65,7 @@ from rbvor.bearing import BearingTracker, to_int_bearing
 from rbvor.dsp import VorDemod
 from rbvor.loc import LocDemod, LocQuality
 from rbvor.quality import ACCEPTABLE, QualityEstimator
-from rbvor.sdr import SdrError
+from rbvor.sdr import GAIN_STEP, SdrError
 
 __all__ = ["State", "Controller", "SdrPort", "PublisherPort"]
 
@@ -91,6 +92,20 @@ DECODING_STATES = frozenset({State.ACQUIRING, State.TRACKING,
                              State.DEGRADED, State.NO_SIGNAL})
 
 
+def gain_policy_for(state: State) -> str:
+    """A47: what automatic gain may do in this state.
+
+    TRACKING: "protect" -- only a severely clipping ADC is stepped down, since
+    every step costs the windows that span it. Looking for a signal (ACQUIRING,
+    NO_SIGNAL) or holding a weak one (DEGRADED): "free". Not decoding: "hold".
+    """
+    if state is State.TRACKING:
+        return "protect"
+    if state in (State.ACQUIRING, State.NO_SIGNAL, State.DEGRADED):
+        return "free"
+    return "hold"
+
+
 class SdrPort(Protocol):
     def set_frequency(self, nav_hz: int) -> None:
         """Tune to a navaid frequency. The port applies the configured offset."""
@@ -107,6 +122,231 @@ class PublisherPort(Protocol):
         ...
 
 
+class GsReceiver:
+    """The glide slope's own receiver (A40, docs/gs-plan.md 6.3).
+
+    One glide-path channel on one port, with its own state, demodulator and
+    quality, so the localizer and the glide slope can each fail alone (plan
+    4.1). The same object serves both arrangements:
+
+    * *dedicated*: the port is the glide-slope dongle and the localizer runs
+      beside it on the nav dongle;
+    * *shared*: the port is the nav dongle itself, lent while the pilot has
+      the glide slope selected; the controller's own state mirrors this one.
+
+    It mirrors `Controller._handle_loc` window by window -- validity from the
+    signal, never from the DDM (noise decodes as DDM ~ 0) -- and the
+    controller's TUNING / NO_SDR / hold timers. Every event calls `on_event`,
+    and the controller publishes one payload carrying all the fields.
+    """
+
+    def __init__(self, gs_cfg, clock: Callable[[], float], settle_s: float,
+                 hold_s: float, on_event: Callable[[str], None],
+                 obs_sink=None, before_retry: Callable[[], bool] | None = None,
+                 recorder=None):
+        from rbvor.gs import GsDemod
+        self.cfg = gs_cfg
+        self.clock = clock
+        self.settle_s = settle_s
+        self.hold_s = hold_s
+        self.on_event = on_event
+        self.obs_sink = obs_sink
+        #: Called before each NO_SDR retry; False abandons the attempt (the
+        #: controller has changed the arrangement, A40).
+        self.before_retry = before_retry
+        #: A46: the glide slope's own RingRecorder (or None), fed this
+        #: receiver's IQ and dumped on a glide-slope flag.
+        self.recorder = recorder
+        self.last_iq_ref = ""
+        self.demod = GsDemod(gs_cfg.dsp)
+        self.quality = LocQuality(gs_cfg.quality)
+        self.port: SdrPort | None = None
+        self.release = True
+        self.state = State.IDLE
+        self.reason = "idle"
+        self.channel_khz: int | None = None
+        self._settle_at = 0.0
+        self._retry_at = 0.0
+        self._last_window_at = 0.0
+        self._flush()
+
+    #: A45: seconds without a single window, while decoding, before the
+    #: glide slope declares that it hears nothing. Six hops at the shipped
+    #: 0.5 s; well clear of the 1 s window plus the filter fill after a retune.
+    STARVED_S = 3.0
+
+    @property
+    def active(self) -> bool:
+        return self.state is not State.IDLE
+
+    def _flush(self) -> None:
+        self.demod.reset()
+        self.quality.reset()
+        self.hist: list[float] = []
+        self.ddm: float | None = None
+        self.last_obs = None
+        self.last_q = None
+        self._consecutive_valid = 0
+        self._last_good_at: float | None = None
+        self._discard_next = True
+
+    def _enter(self, state: State, reason: str) -> None:
+        if state != self.state:
+            self.state = state
+            self.reason = reason
+            if state in (State.IDLE, State.NO_SDR) and self.release and self.port is not None:
+                try:
+                    self.port.close()
+                except Exception as e:               # noqa: BLE001
+                    log.debug("GS SDR release: %s", e)
+
+    def start(self, gs_khz: int, port: SdrPort, release: bool) -> None:
+        """Retune to a glide-path channel: TUNING and flush before the payload
+        is built (A26's order), then move the tuner."""
+        self.port, self.release = port, release
+        self.state = State.TUNING                    # no release on the way through
+        self.reason = f"tuning glide path {gs_khz / 1000:.2f} MHz"
+        self._flush()
+        self.channel_khz = gs_khz
+        if self.recorder is not None:
+            self.recorder.reset()            # the old channel's IQ is not evidence here
+            self.recorder.set_channel(gs_khz * 1000)
+        self.on_event(self.reason)
+        self._tune()
+
+    def stop(self, release: bool | None = None) -> None:
+        """Back to IDLE. `release` False keeps a shared dongle open for the
+        localizer that is about to retune it. Publishes nothing: the caller
+        publishes the payload that results."""
+        if release is not None:
+            self.release = release
+        self.channel_khz = None
+        self._flush()
+        self._enter(State.IDLE, "glide slope not selected")
+        self.release = True
+
+    def _tune(self) -> None:
+        try:
+            self.port.set_frequency(self.channel_khz * 1000)
+        except SdrError as e:
+            self._retry_at = self.clock() + self.cfg.retry_s
+            self._enter(State.NO_SDR, f"glide-slope SDR unavailable: {e}")
+            self.on_event(self.reason)
+            return
+        self._settle_at = self.clock() + self.settle_s
+
+    def tick(self) -> None:
+        now = self.clock()
+        if self.state is State.NO_SDR and now >= self._retry_at:
+            if self.before_retry is not None and not self.before_retry():
+                return
+            self.state = State.TUNING
+            self.reason = f"tuning glide path {self.channel_khz / 1000:.2f} MHz"
+            self._tune()
+            if self.state is State.TUNING:
+                self.on_event("glide-slope SDR available")
+            return
+        if self.state is State.TUNING and now >= self._settle_at:
+            self._enter(State.ACQUIRING, "settled")
+            self._last_window_at = now
+            self.on_event("acquiring")
+            return
+        if (self.state in (State.ACQUIRING, State.TRACKING, State.DEGRADED)
+                and now - self._last_window_at >= self.STARVED_S):
+            # A45: no samples -- a dongle pulled or wedged mid-reception (the
+            # A30 gap). Without this the last usable gsdev would stay on the
+            # bridge as a valid marker for as long as the silence lasted.
+            self.ddm = None
+            self._consecutive_valid = 0
+            self._enter(State.NO_SIGNAL, "no samples from the glide-slope dongle")
+            self._last_good_at = now
+            self.on_event(self.reason)
+            return
+        if (self.state is State.NO_SIGNAL and self._last_good_at is not None
+                and now - self._last_good_at >= self.hold_s):
+            self._flush()
+            self._enter(State.ACQUIRING, "signal lost; re-acquiring")
+            self.on_event(self.reason)
+
+    def push(self, iq: np.ndarray, gap: bool = False) -> int:
+        if self.state not in DECODING_STATES:
+            return 0
+        if self.recorder is not None and not gap:
+            self.recorder.push(iq)
+        n = 0
+        for obs in self.demod.push(iq, gap=gap):
+            self._last_window_at = self.clock()
+            if self._discard_next:
+                self._discard_next = False
+                continue
+            self._handle(obs)
+            n += 1
+        return n
+
+    def _handle(self, obs) -> None:
+        now = self.clock()
+        if self.obs_sink is not None:
+            self.obs_sink(obs, self.channel_khz or 0)
+        self.last_obs = obs
+        if obs.overrun:
+            self.ddm = None
+            self._enter(State.NO_SIGNAL, "sample overrun in window")
+            self.on_event(self.reason)
+            return
+        raw = obs.ddm_corrected                       # A42: the published form
+        self.hist = (self.hist + [raw])[-self.cfg.smooth_n:]
+        self.ddm = float(np.mean(self.hist))
+        q = self.quality.update(obs, raw)             # A15: raw judged
+        self.last_q = q
+        if q.warming:
+            self._enter(State.ACQUIRING, q.reason)
+            self.on_event(q.reason)
+            return
+        if q.flagged:
+            self._consecutive_valid = 0
+            self._maybe_capture(q.reason)
+            self._enter(State.NO_SIGNAL, q.reason)
+            self.on_event(q.reason)
+            return
+        self._consecutive_valid += 1
+        self._last_good_at = now
+        if self.state is State.ACQUIRING and self._consecutive_valid < 2:
+            self.on_event("acquiring")
+            return
+        hold = LOC_SPLIT_HYSTERESIS if self.state in (State.TRACKING, State.DEGRADED) else 0
+        tracking = (q.value >= ACCEPTABLE - hold if self.state is State.TRACKING
+                    else q.value >= ACCEPTABLE + hold)
+        self._enter(State.TRACKING if tracking else State.DEGRADED, f"gssignal {q.value}")
+        self.on_event(self.reason)
+
+    def _maybe_capture(self, reason: str) -> None:
+        if self.recorder is None or self.cfg_trigger != "on_flag":
+            return
+        import contextlib
+        with contextlib.suppress(Exception):         # capture never stalls decoding
+            path = self.recorder.trigger(reason=f"glide slope: {reason}",
+                                         extra={"channel_khz": self.channel_khz})
+            if path is not None:
+                self.last_iq_ref = path.name
+
+    #: record.trigger, set by the controller; only on_flag is implemented (D6).
+    cfg_trigger = "on_flag"
+
+    def wire(self, shared: bool):
+        from rbvor.publisher import GsWire
+        if self.channel_khz is None:
+            return GsWire(shared=shared)
+        o = self.last_obs
+        status = Controller._STATUS_CODE.get(self.state, 0)
+        return GsWire(status=status,
+                      ddm=self.ddm if o is not None else None,
+                      sdm=o.sdm if o is not None else 0.0,
+                      snr_db=o.snr_db if o is not None else 0.0,
+                      freq_khz=self.channel_khz,
+                      usable=status >= 4 and self.ddm is not None,
+                      shared=shared)
+
+
 class Controller:
     """Owns the demodulator, the bearing tracker and the quality estimator."""
 
@@ -115,7 +355,10 @@ class Controller:
                  notify: Callable[[], None] | None = None,
                  recorder=None, solution_sink=None, obs_sink=None,
                  sdr_retry_s: float | None = None,
-                 loc_solution_sink=None, loc_obs_sink=None):
+                 loc_solution_sink=None, loc_obs_sink=None,
+                 gs_sdr: SdrPort | None = None,
+                 allocate: Callable[[], bool] | None = None,
+                 gs_solution_sink=None, gs_obs_sink=None, gs_recorder=None):
         self.cfg = cfg
         self.sdr = sdr
         self.publisher = publisher
@@ -157,6 +400,30 @@ class Controller:
         self._last_loc_obs = None
         self._last_loc_q = None
 
+        # A39-A44: the glide slope. Built only when enabled (it requires the
+        # localizer, config validation says so). `gs_sdr` is a second dongle;
+        # `allocate()` answers, at every tune attempt, whether the glide slope
+        # has a dongle of its own (True) or shares the nav one (False), and
+        # rebinds the readers as a side effect (__main__ does that from
+        # `sdr.allocate`). Without it: dedicated exactly when gs_sdr is given.
+        gs_cfg = cfg.gs if hasattr(cfg, "gs") else None
+        self.gs_enabled = bool(self.loc_enabled and gs_cfg and gs_cfg.enabled)
+        self.gs_sdr = gs_sdr
+        self.allocate = allocate
+        self.gs_solution_sink = gs_solution_sink
+        self.gs_rx: GsReceiver | None = None
+        if self.gs_enabled:
+            self.gs_rx = GsReceiver(gs_cfg, clock, cfg.sdr["settle_ms"] / 1000.0,
+                                    cfg.publish["hold_s"], self._on_gs_event,
+                                    obs_sink=gs_obs_sink,
+                                    before_retry=self._gs_before_retry,
+                                    recorder=gs_recorder)
+            self.gs_rx.cfg_trigger = cfg.record["trigger"]
+        self._gs_dedicated = False   # arrangement decided at the last tune attempt
+        self._gs_want = 0            # pilot's selection on a shared receiver
+        self._gs_select_last: int | None = None
+        self._gs_select_at: float | None = None
+
         self.state = State.IDLE
         self.channel_khz: int | None = None
         self.last_reason = "startup"
@@ -174,6 +441,13 @@ class Controller:
         self._last_q = None
         self._last_obs = None
         self._gps_track: float | None = None
+
+        # A47: windows still to drop silently after an automatic gain step.
+        self._gain_discard = 0
+        if hasattr(sdr, "gain_policy"):
+            sdr.gain_policy = self._gain_policy
+        if gs_sdr is not None and hasattr(gs_sdr, "gain_policy") and self.gs_rx is not None:
+            gs_sdr.gain_policy = lambda: gain_policy_for(self.gs_rx.state)
 
     # -- helpers ----------------------------------------------------------- #
 
@@ -271,17 +545,25 @@ class Controller:
         if self.solution_sink is not None:
             self._emit_solution(vordir, vorsignal, reason or self.last_reason)
 
-    def _publish_with_loc(self, vordir, vorsignal: int, reason: str) -> None:
+    def _publish_with_loc(self, vordir, vorsignal: int, reason: str,
+                          source: str = "main") -> None:
         """`_publish` when the localizer is enabled: the v2.3 payload, in which
-        a LOC channel reads as a rejected frequency in the vor* fields."""
+        a LOC channel reads as a rejected frequency in the vor* fields. With
+        the glide slope enabled (A44) the gs* half rides in the same POST, and
+        a shared receiver with the glide slope selected (mode "gs") reads as
+        a LOC channel does. `source` "gs" is a glide-slope event: it goes on
+        the wire with everything else, but into the glide-slope log only."""
         loc = self._loc_wire()
+        extra = {"gs": self._gs_wire()} if self.gs_enabled else {}
         why = reason or self.last_reason
-        if self.mode == "loc":
+        if self.mode in ("loc", "gs"):
             self.publisher.publish(None, 0.0, 0.0, state=str(self.state), valid=False,
                                    status=0, sub_level=0.0, freq_khz=0,
-                                   reason=why, loc=loc)
-            if self.loc_solution_sink is not None:
+                                   reason=why, loc=loc, **extra)
+            if source == "main" and self.mode == "loc" and self.loc_solution_sink is not None:
                 self._emit_loc_solution(why)
+            if source == "gs" and self.gs_solution_sink is not None:
+                self._emit_gs_solution(why)
             return
         valid = vorsignal > 0 and vordir is not None
         o = self._last_obs
@@ -290,9 +572,172 @@ class Controller:
                                status=self._STATUS_CODE.get(self.state, 0),
                                sub_level=o.sub_level if o else 0.0,
                                freq_khz=self.channel_khz if self.channel_khz else 0,
-                               reason=why, loc=loc)
+                               reason=why, loc=loc, **extra)
         if self.solution_sink is not None:
             self._emit_solution(vordir, vorsignal, why)
+
+    # -- glide slope (A39-A44) --------------------------------------------- #
+
+    def _gs_paired_khz(self) -> int | None:
+        """The glide path of the selected channel, if it is a localizer."""
+        if not self.gs_enabled or self.mode not in ("loc", "gs"):
+            return None
+        return freqrules.gs_channel_khz(self.channel_khz)
+
+    def _gs_shared(self) -> bool:
+        """`gsshared`: the selected ILS's LOC and GS must share one receiver."""
+        return self._gs_paired_khz() is not None and not self._gs_dedicated
+
+    def _gs_wire(self):
+        from rbvor.publisher import GsWire
+        shared = self._gs_shared()
+        rx = self.gs_rx
+        if rx is not None and rx.channel_khz is not None and (
+                self.mode == "gs" or (self.mode == "loc" and self._gs_dedicated)):
+            return rx.wire(shared)
+        return GsWire(shared=shared)
+
+    def _gs_plan(self) -> bool:
+        """Ask the allocation whether the glide slope has its own dongle.
+        Re-evaluated at every tune attempt: dongles are hot-plugged and taken
+        by the radio (plan 6.1). A failure keeps the last answer."""
+        if self.allocate is None:
+            return self.gs_sdr is not None
+        try:
+            return bool(self.allocate())
+        except SdrError as e:
+            log.warning("dongle allocation failed: %s", e)
+            return self._gs_dedicated
+
+    def _gs_port(self) -> SdrPort:
+        return self.gs_sdr if self._gs_dedicated else self.sdr
+
+    def _on_gs_event(self, reason: str) -> None:
+        if self.mode == "gs":
+            # shared receiver, glide slope selected: the controller's own state
+            # is the glide slope's, for the journal and the dashboard
+            self.state, self.last_reason = self.gs_rx.state, self.gs_rx.reason
+        self._publish_with_loc(None, 0, reason, source="gs")
+
+    def _gs_before_retry(self) -> bool:
+        """Before a glide-slope NO_SDR retry: is the arrangement unchanged?
+        A dedicated GS dongle that has gone away turns the receiver shared."""
+        if self.mode != "loc" or not self._gs_dedicated:
+            return True
+        if self._gs_plan():
+            return True
+        self._gs_dedicated = False
+        self.gs_rx.stop(release=True)
+        self._publish_with_loc(None, 0, "glide slope now shares the nav dongle", source="gs")
+        return False
+
+    def _gs_stop(self) -> None:
+        """The selected channel is no longer this ILS: GS off, its dongle freed."""
+        if self.gs_rx is not None and self.gs_rx.active:
+            self.gs_rx.stop(release=self._gs_dedicated)
+
+    def _gs_start_dedicated(self) -> None:
+        gs_khz = self._gs_paired_khz()
+        if gs_khz is not None and self._gs_dedicated:
+            self.gs_rx.start(gs_khz, self.gs_sdr, release=True)
+
+    def set_gs_select(self, value) -> None:
+        """A `gsselect` value arrived: 0 localizer, 1 glide slope (plan 6.2).
+
+        Edge-triggered: only a value different from the last one received
+        counts, so a bridge re-asserting its whole state (A16) cannot undo the
+        reset to LOC that a new `vorfreq` makes. The first value after start
+        is an edge, so a restarted daemon returns to the pilot's choice (A31).
+        Debounced like a frequency; acted on only for a shared receiver on an
+        ILS with a glide path, read and ignored otherwise."""
+        if value is None:
+            return
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            log.warning("gsselect is not 0 or 1: %r", value)
+            return
+        if v not in (0, 1):
+            log.warning("gsselect is not 0 or 1: %r", value)
+            return
+        if v == self._gs_select_last:
+            return
+        self._gs_select_last = v
+        self._gs_want = v
+        self._gs_select_at = self.clock()
+
+    def _apply_gs_select(self) -> None:
+        self._gs_select_at = None
+        if self._pending is not None or self._gs_paired_khz() is None:
+            return                     # a retune will read _gs_want itself
+        want = "gs" if self._gs_want else "loc"
+        if want == self.mode:
+            return                     # A16: already there, or on the way
+        if self._gs_dedicated:
+            return                     # both run; nothing to switch
+        self._gs_dedicated = self._gs_plan()
+        if self._gs_dedicated:
+            # A second dongle has appeared since the last tune (plan 6.3 table):
+            # no switch is needed any more; the glide slope gets its own.
+            if self.mode == "gs":
+                self._switch_to_loc("glide slope moved to its own dongle")
+            self._gs_start_dedicated()
+            return
+        if want == "gs":
+            self._switch_to_gs()
+        else:
+            self._switch_to_loc("localizer selected")
+
+    def _switch_to_gs(self) -> None:
+        """Shared receiver: localizer -> glide slope. The localizer goes dark
+        in the same POST that says the glide slope is tuning (plan 4.5)."""
+        self.state, self.last_reason = State.TUNING, "switching to the glide slope"
+        self._flush()                  # the localizer's DDM dies here
+        self.mode = "gs"
+        self.gs_rx.start(self._gs_paired_khz(), self.sdr, release=True)
+
+    def _switch_to_loc(self, reason: str) -> None:
+        """Shared receiver: glide slope -> localizer, by the same rule."""
+        self.gs_rx.stop(release=False)  # the localizer retunes this dongle now
+        self.state, self.last_reason = State.TUNING, reason
+        self._flush()
+        self.mode = "loc"
+        self._publish(None, 0, f"retune to {self.channel_khz / 1000:.3f} MHz")
+        self._tune()
+
+    def push_gs(self, iq: np.ndarray, gap: bool = False) -> int:
+        """Samples from the dedicated glide-slope dongle."""
+        if self.gs_rx is None or self.mode != "loc" or not self._gs_dedicated:
+            return 0
+        return self.gs_rx.push(iq, gap=gap)
+
+    def _emit_gs_solution(self, reason: str) -> None:
+        import contextlib
+        from datetime import datetime
+
+        from rbvor.solutionlog import GsSolutionRecord
+        rx = self.gs_rx
+        q, o = rx.last_q, rx.last_obs
+        wire = self._gs_wire()
+        rec = GsSolutionRecord(
+            t_utc=datetime.now(tz=UTC).isoformat(), t_mono=self.clock(),
+            channel_khz=rx.channel_khz, loc_channel_khz=self.channel_khz,
+            state=str(rx.state), gsstatus=wire.status,
+            ddm=rx.ddm if wire.usable else None, valid=wire.usable, shared=wire.shared,
+            reason=reason,
+            q_sdm=q.q_sdm if q else 0.0, q_snr=q.q_snr if q else 0.0,
+            q_stab=q.q_stab if q else 0.0, value=q.value if q else 0,
+            m90=o.m90 if o else 0.0, m150=o.m150 if o else 0.0,
+            ddm_raw=o.ddm if o else 0.0, ddm_corrected=o.ddm_corrected if o else 0.0,
+            sdm=o.sdm if o else 0.0, snr_db=o.snr_db if o else 0.0,
+            tone_offset=o.tone_offset if o else 0.0, carrier=o.carrier if o else 0.0,
+            carrier_offset_hz=o.carrier_offset_hz if o else 0.0,
+            acquired_hz=getattr(o, "acquired_hz", 0.0) if o else 0.0,
+            gps_track=self._gps_track, overrun=o.overrun if o else False,
+            iq_ref=rx.last_iq_ref,
+        )
+        with contextlib.suppress(Exception):         # a log failure never stalls a solution
+            self.gs_solution_sink(rec)
 
     def _emit_loc_solution(self, reason: str) -> None:
         import contextlib
@@ -366,8 +811,21 @@ class Controller:
         with contextlib.suppress(Exception):         # a log failure never stalls a bearing
             self.solution_sink(rec)
 
+    def _gain_policy(self) -> str:
+        if self.mode == "gs" and self.gs_rx is not None:
+            return gain_policy_for(self.gs_rx.state)
+        return gain_policy_for(self.state)
+
+    def _gain_step_windows(self) -> int:
+        """A47: windows that may contain samples from both sides of a gain step,
+        or from the carrier estimate settling after it."""
+        dsp = self.loc_cfg.dsp if self.mode == "loc" else self.cfg.dsp
+        settle = float((self.cfg.sdr.get("auto_gain") or {}).get("settle_s", 1.5))
+        return math.ceil((dsp.integration_s + settle) / dsp.hop_s)
+
     def _flush(self) -> None:
         """Drop everything derived from the previous signal."""
+        self._gain_discard = 0
         self.demod.reset()
         self.tracker.reset()
         self.quality.reset()
@@ -399,7 +857,9 @@ class Controller:
         """A `vorfreq` value arrived (or went away). Debounced, never immediate."""
         if mhz is None:
             self._pending = None
+            self._gs_want = 0
             if self.state is not State.IDLE:
+                self._gs_stop()
                 self.channel_khz = None
                 self.mode = None
                 self._flush()
@@ -413,6 +873,7 @@ class Controller:
             ok = freqrules.is_loc_frequency(mhz, **self._freq_kwargs)[0]
         if not ok:
             self._pending = None
+            self._gs_stop()
             self.channel_khz = None
             self._flush()
             if self.state is not State.INVALID_FREQ:
@@ -443,6 +904,9 @@ class Controller:
         # a retune per detent.
         if self._pending is None or self._pending[0] != ch:
             self._pending = (ch, self.clock())
+            # plan 6.2: a new station always starts on the localizer, whatever
+            # the bridge still holds for gsselect (edge-triggered, see there)
+            self._gs_want = 0
 
     def on_bridge_connected(self) -> None:
         self._bridge_lost_at = None
@@ -460,9 +924,18 @@ class Controller:
         is what guarantees that no bearing derived from station A can ever be
         published after a retune to station B (F3).
         """
+        if self.mode == "gs":
+            # A40: shared receiver, glide slope selected. The glide slope
+            # records into its own ring (A46), never into the nav one.
+            return self.gs_rx.push(iq, gap=gap)
         if self.state not in DECODING_STATES:
             return 0
-        if self.recorder is not None and not gap:
+        if gap is GAIN_STEP:
+            # A47: an automatic gain step. The samples are continuous, so the
+            # ring keeps them, and the windows spanning the step are dropped
+            # without the NO_SIGNAL a real overrun means (F9).
+            self._gain_discard = self._gain_step_windows()
+        if self.recorder is not None and (not gap or gap is GAIN_STEP):
             self.recorder.push(iq)
         published = 0
         if self.mode == "loc":
@@ -471,12 +944,18 @@ class Controller:
                 if self._discard_next:
                     self._discard_next = False
                     continue
+                if self._gain_discard:
+                    self._gain_discard -= 1
+                    continue
                 self._handle_loc(obs)
                 published += 1
             return published
         for obs in self.demod.push(iq, gap=gap):
             if self._discard_next:
                 self._discard_next = False
+                continue
+            if self._gain_discard:
+                self._gain_discard -= 1
                 continue
             self._handle(obs)
             published += 1
@@ -611,6 +1090,7 @@ class Controller:
         if not self.loc_enabled:
             return
         self._pending = None
+        self._gs_stop()
         self.channel_khz = None
         self.mode = None
         self._flush()
@@ -634,12 +1114,15 @@ class Controller:
         now = self.clock()
         if self.notify is not None:
             self.notify()
+        if self.gs_rx is not None and self.gs_rx.active:
+            self.gs_rx.tick()
 
         # bridge loss -> release the SDR rather than keep transmitting to a
         # bridge we can no longer hear from (doc A section 10.4)
         if (self._bridge_lost_at is not None
                 and now - self._bridge_lost_at >= self.cfg.bridge["ws_grace_s"]):
             if self.state is not State.IDLE:
+                self._gs_stop()
                 self.channel_khz = None
                 self.mode = None
                 self._pending = None
@@ -655,13 +1138,27 @@ class Controller:
                 self._retune(ch)
                 return
 
+        if (self._gs_select_at is not None
+                and (now - self._gs_select_at) * 1000.0 >= self.cfg.frequency["debounce_ms"]):
+            self._apply_gs_select()
+            return
+
+        if self.mode == "gs":
+            return            # the glide-slope receiver runs its own timers
+
         if self.state is State.NO_SDR and now >= self._sdr_retry_at:
+            if self._gs_paired_khz() is not None and not self.gs_rx.active:
+                # A40: a tune attempt re-reads the allocation (and rebinds the
+                # nav reader as a side effect)
+                self._gs_dedicated = self._gs_plan()
             # Published only if it worked: a refused attempt changes nothing,
             # so the plate must not flash TUNING every retry_s.
             self._enter(State.TUNING, f"tuning {self.channel_khz / 1000:.3f} MHz")
             self._tune()
             if self.state is State.TUNING:
                 self._publish(None, 0, "SDR available")
+                if self._gs_dedicated and not self.gs_rx.active:
+                    self._gs_start_dedicated()
             return
 
         if self.state is State.TUNING and now >= self._settle_at:
@@ -692,6 +1189,7 @@ class Controller:
         station's measurements are flushed *before* the payload is built, so
         the retune POST says honestly "tuning, nothing measured yet" (F3).
         """
+        self._gs_stop()
         self._enter(State.TUNING, f"tuning {channel_khz / 1000:.3f} MHz")
         self._flush()
         self.channel_khz = channel_khz
@@ -700,8 +1198,22 @@ class Controller:
             channel_khz / 1000.0, **self._freq_kwargs)[0] else "vor")
         if self.recorder is not None:
             self.recorder.set_channel(channel_khz * 1000)   # so a flag capture names its channel
+        if self._gs_paired_khz() is not None:
+            # A40: which arrangement, decided at every tune attempt. A shared
+            # receiver starts on the localizer unless the pilot's selection
+            # says otherwise (a restarted daemon reading it back, A31).
+            self._gs_dedicated = self._gs_plan()
+            if not self._gs_dedicated and self._gs_want:
+                self.mode = "gs"
+                self.state, self.last_reason = State.TUNING, "tuning the glide slope"
+                self.gs_rx.start(self._gs_paired_khz(), self.sdr, release=True)
+                return
         self._publish(None, 0, f"retune to {channel_khz / 1000:.3f} MHz")
         self._tune()
+        if self._gs_dedicated:
+            # each axis fails alone: a nav dongle that will not open does not
+            # stop the glide slope, nor the reverse (plan 6.3)
+            self._gs_start_dedicated()
 
     def _tune(self) -> None:
         """Move the tuner, which claims the dongle if the daemon does not hold it.

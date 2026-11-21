@@ -32,6 +32,10 @@ Two rules that shape the design:
   it -- the spec then places the staleness timeout on the consumer (section 4,
   item 2). Doc A's periodic / on_change choice no longer exists.
 
+RB-VOR-IF v2.4 (A44, `docs/RB-VOR-IF-v2.4.md`) adds seven glide-slope fields
+(`gsstatus`, `gsdev`, `gsddm`, `gssdm`, `gssnr`, `gsfreqactive`, `gsshared`),
+on the wire only with `gs.enabled`, by the same rule as the localizer's.
+
 RB-VOR-IF v2.3 (A33, `docs/RB-VOR-IF-v2.3.md`) adds six localizer fields
 (`locstatus`, `locdev`, `locddm`, `locsdm`, `locsnr`, `locfreqactive`). They
 are on the wire only when the receiver has `loc.enabled`: the controller then
@@ -58,7 +62,8 @@ import numpy as np
 from rbvor.bearing import to_int_bearing
 
 __all__ = ["PublishPolicy", "Publisher", "Transport", "RecordingTransport",
-           "HttpTransport", "Decision", "LocWire", "LOC_KEYS", "LOC_DEADBAND"]
+           "HttpTransport", "Decision", "LocWire", "LOC_KEYS", "LOC_DEADBAND",
+           "GsWire", "GS_KEYS", "GS_DEADBAND"]
 
 log = logging.getLogger("rbvor.publisher")
 
@@ -86,6 +91,33 @@ class LocWire:
     freq_khz: int = 0
     usable: bool = False
 
+
+@dataclass(frozen=True)
+class GsWire:
+    """What the controller hands the publisher about the glide slope (A44).
+
+    Same shape as `LocWire`, plus `shared`: 1 when the localizer and glide path
+    of the selected ILS have to share one receiver, so only one is received
+    and the pilot's `gsselect` chooses which."""
+
+    status: int = 0
+    ddm: float | None = None
+    sdm: float = 0.0
+    snr_db: float = 0.0
+    freq_khz: int = 0
+    usable: bool = False
+    shared: bool = False
+
+
+GS_KEYS = ("gsstatus", "gsdev", "gsddm", "gssdm", "gssnr", "gsfreqactive", "gsshared")
+
+#: A44: the localizer's deadbands in the glide slope's own wire units. `gsdev`
+#: 2 = at most 2 % of the glide-slope full scale (0.0035 DDM) from the
+#: measurement. Rate measured in docs/gs-sweep.md "Publish rate".
+GS_DEADBAND = {"gsdev": 2.0, "gsddm": 4.0, "gssdm": 2.0, "gssnr": 4.0}
+
+#: Airborne full-scale DDM of the glide slope (rbvor/gs.py, O26).
+_GS_FULL_SCALE = 0.175
 
 LOC_KEYS = ("locstatus", "locdev", "locddm", "locsdm", "locsnr", "locfreqactive")
 
@@ -123,6 +155,8 @@ class PublishPolicy:
         self._last_state: str | None = None
         self._loc_ref: dict[str, int] | None = None     # A38 hysteresis anchor
         self._loc_ctx: tuple[int, int] | None = None    # (status, freq) of the anchor
+        self._gs_ref: dict[str, int] | None = None      # A44 hysteresis anchor
+        self._gs_ctx: tuple[int, int] | None = None
 
     def reset(self) -> None:
         self._last_sent_at = None
@@ -130,6 +164,8 @@ class PublishPolicy:
         self._last_state = None
         self._loc_ref = None
         self._loc_ctx = None
+        self._gs_ref = None
+        self._gs_ctx = None
 
     # -- payload shaping --------------------------------------------------- #
 
@@ -217,17 +253,57 @@ class PublishPolicy:
                 "locddm": out["locddm"], "locsdm": max(0, out["locsdm"]),
                 "locsnr": max(0, out["locsnr"]), "locfreqactive": int(loc.freq_khz)}
 
+    def _shape_gs(self, gs: GsWire) -> dict[str, int]:
+        """The v2.4 glide-slope fields (A44), with the A38 hysteresis.
+
+        gsstatus     : same codes as vorstatus; >= 4 usable
+        gsdev        : DDM as % of full scale (0.175 = 100), clamped to +/-100,
+                       + = 150 Hz predominates = below the path = **fly up**;
+                       0 unless usable, like locdev
+        gsddm        : published DDM x1000, not clamped, not gated (A26)
+        gssdm        : sum of depths x100 (nominal 80)
+        gssnr        : tone SNR, whole dB, >= 0
+        gsfreqactive : glide-path channel a receiver is tuned to, kHz; 0 if none
+        gsshared     : 1 when LOC and GS of the selected ILS share one receiver
+        """
+        have = gs.ddm is not None
+        raw = {
+            "gsdev": (100.0 * gs.ddm / _GS_FULL_SCALE) if (have and gs.usable) else 0.0,
+            "gsddm": 1000.0 * gs.ddm if have else 0.0,
+            "gssdm": 100.0 * gs.sdm if have else 0.0,
+            "gssnr": max(0.0, gs.snr_db) if have else 0.0,
+        }
+        ctx = (int(gs.status), int(gs.freq_khz))
+        fresh = self._gs_ref is None or ctx != self._gs_ctx or not have
+        out: dict[str, int] = {}
+        for k, x in raw.items():
+            if fresh or k not in self._gs_ref:
+                out[k] = _sym_round(x)
+                continue
+            d = GS_DEADBAND[k]
+            lo, hi = int(np.ceil(x - d)), int(np.floor(x + d))
+            out[k] = min(max(self._gs_ref[k], lo), hi)
+        out["gsdev"] = max(-100, min(100, out["gsdev"]))
+        self._gs_ref = dict(out)
+        self._gs_ctx = ctx
+        return {"gsstatus": int(gs.status), "gsdev": out["gsdev"], "gsddm": out["gsddm"],
+                "gssdm": max(0, out["gssdm"]), "gssnr": max(0, out["gssnr"]),
+                "gsfreqactive": int(gs.freq_khz), "gsshared": int(bool(gs.shared))}
+
     # -- decision ---------------------------------------------------------- #
 
     def decide(self, vordir: int | None, snr_db: float = 0.0,
                am_depth: float = 0.0, *, state: str, valid: bool = True,
                status: int = 0, sub_level: float = 0.0, freq_khz: int = 0,
-               transition: bool = False, loc: LocWire | None = None) -> Decision:
+               transition: bool = False, loc: LocWire | None = None,
+               gs: GsWire | None = None) -> Decision:
         now = self.clock()
         payload = self._shape(vordir, snr_db, am_depth, valid, status, sub_level,
                               freq_khz)
         if loc is not None:
             payload.update(self._shape_loc(loc))
+        if gs is not None:
+            payload.update(self._shape_gs(gs))
 
         # Requirement 5: transmit only when a parameter changes. A state
         # transition (retune, flag raised/cleared) always sends, since the
@@ -298,7 +374,18 @@ class RecordingTransport:
             # usable -- flagged with a trailing '?' so the bench operator reads
             # the same gate the consumer applies.
             usable = "" if st >= 4 else " ?"
+            gf = payload.get("gsfreqactive", 0)
             lf = payload.get("locfreqactive", 0)
+            if gf and not lf:
+                # A44: one receiver, glide slope selected
+                gst = payload.get("gsstatus", 0)
+                gu = "" if gst >= 4 else " ?"
+                print(f"  [{names.get(gst, str(gst)):6}] {gf/1000:.3f} MHz  GS  dev "
+                      f"{payload.get('gsdev', 0):+4d}%{gu}  ddm "
+                      f"{payload.get('gsddm', 0)/1000:+.3f}  sdm "
+                      f"{payload.get('gssdm', 0)/100:.2f}  snr "
+                      f"{payload.get('gssnr', 0):2d} dB", flush=True)
+                return
             if lf:
                 # A33: on a localizer channel the vor* fields are all 0
                 ls = payload.get("locstatus", 0)
@@ -307,7 +394,11 @@ class RecordingTransport:
                       f"{payload.get('locdev', 0):+4d}%{lu}  ddm "
                       f"{payload.get('locddm', 0)/1000:+.3f}  sdm "
                       f"{payload.get('locsdm', 0)/100:.2f}  snr "
-                      f"{payload.get('locsnr', 0):2d} dB", flush=True)
+                      f"{payload.get('locsnr', 0):2d} dB"
+                      + (f"  | GS {payload.get('gsdev', 0):+4d}%"
+                         f"{'' if payload.get('gsstatus', 0) >= 4 else ' ?'} "
+                         f"[{names.get(payload.get('gsstatus', 0), '?')}]" if gf else ""),
+                      flush=True)
                 return
             print(f"  [{stn:6}] {fq} MHz  radial {radial:3d}\u00b0{usable}  "
                   f"snr {snr:2d} dB  am {am/100:.2f}  sub {sub/100:.2f}",
@@ -333,10 +424,11 @@ class Publisher:
     def publish(self, vordir: int | None, snr_db: float = 0.0,
                 am_depth: float = 0.0, *, state: str, valid: bool = True,
                 status: int = 0, sub_level: float = 0.0, freq_khz: int = 0,
-                reason: str = "", loc: LocWire | None = None) -> None:
+                reason: str = "", loc: LocWire | None = None,
+                gs: GsWire | None = None) -> None:
         d = self.policy.decide(vordir, snr_db, am_depth, state=state, valid=valid,
                                status=status, sub_level=sub_level,
-                               freq_khz=freq_khz, loc=loc)
+                               freq_khz=freq_khz, loc=loc, gs=gs)
         if not d.send:
             return
         now = self.clock()

@@ -136,8 +136,10 @@ class LocParams:
             raise ValueError(f"unknown fade {self.fade!r}")
         if self.offset_hz is None:
             self.offset_hz = -self.fs // 4
-        if self.clearance_sep_hz < 0 or self.clearance_sep_hz > 30_000:
-            raise ValueError("clearance_sep_hz must be 0..30000 (ICAO: 5-14 kHz)")
+        if self.clearance_sep_hz < 0 or self.clearance_sep_hz > 40_000:
+            # localizer 5-14 kHz; glide path 4-32 kHz (tools/gs_gen.py, A39)
+            raise ValueError("clearance_sep_hz must be 0..40000 (ICAO: LOC 5-14, "
+                             "GS 4-32 kHz)")
         self._intervals = (morse_intervals(self.ident, self.ident_dot_s)
                            if self.ident else [])
         if self.level == "auto":

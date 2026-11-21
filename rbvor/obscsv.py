@@ -103,3 +103,38 @@ class LocObsCsvSink:
     def close(self) -> None:
         if not self._fh.closed:
             self._fh.close()
+
+
+#: A44: the glide-slope twin (``<csv>-gs.csv``); same columns as the
+#: localizer's plus the coarse acquisition (A41). `ddm_corrected` is the
+#: glide path's own form (SDM nominal 0.80).
+GS_FIELDS = LOC_FIELDS[:-1] + ["acquired_hz", "overrun"]
+
+
+def gs_path_for(path: str | Path) -> Path:
+    """`obs.csv` -> `obs-gs.csv`."""
+    p = Path(path)
+    return p.with_name(f"{p.stem}-gs{p.suffix or '.csv'}")
+
+
+class GsObsCsvSink(LocObsCsvSink):
+    """Per-window glide-slope dump: ``controller.gs_obs_sink``."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self._fh = self.path.open("w", newline="")
+        self._w = csv.writer(self._fh)
+        self._w.writerow(GS_FIELDS)
+        self._fh.flush()
+        self.rows = 0
+
+    def __call__(self, obs, freq_khz: int) -> None:
+        self._w.writerow([
+            f"{obs.t:.3f}", int(freq_khz), f"{obs.ddm:+.5f}", f"{obs.ddm_corrected:+.5f}",
+            f"{obs.m90:.5f}", f"{obs.m150:.5f}", f"{obs.sdm:.5f}",
+            f"{obs.tone_offset:+.5f}", f"{obs.carrier:.6g}", f"{obs.noise_est:.6f}",
+            f"{obs.snr_db:.2f}", f"{obs.carrier_offset_hz:.1f}",
+            f"{getattr(obs, 'acquired_hz', 0.0):.1f}", int(obs.overrun),
+        ])
+        self._fh.flush()
+        self.rows += 1

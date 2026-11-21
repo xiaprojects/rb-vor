@@ -248,6 +248,10 @@ class RingRecorder:
         self._writer = None                # threading.Thread while a write is in flight
         self.captures_written = 0
         self.captures_skipped = 0
+        #: A47: returns the tuner gain in force, so each sidecar records what
+        #: the samples were taken at (under automatic gain it moves). None:
+        #: the template's value stands, as before.
+        self.gain_source = None
 
     def push(self, iq: np.ndarray) -> None:
         """Add a block of complex64 IQ, evicting oldest beyond the budget."""
@@ -317,8 +321,13 @@ class RingRecorder:
         note = f"flag capture: {reason}" if reason else "flag capture"
         if extra:
             note += " | " + ", ".join(f"{k}={v}" for k, v in extra.items())
-        return replace(self.template, format=self.fmt, samples=n,
+        meta = replace(self.template, format=self.fmt, samples=n,
                        duration_s=n / float(self.fs), notes=note, synthetic=None)
+        if self.gain_source is not None:
+            g = self.gain_source()
+            if g is not None:
+                meta = replace(meta, gain_db=float(g))
+        return meta
 
 
 _INT_RANGE = {"cu8": (0.0, 255.0), "cs8": (-128.0, 127.0), "cs16": (-32768.0, 32767.0)}

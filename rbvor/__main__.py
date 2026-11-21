@@ -8,6 +8,7 @@ stay testable without a network or a radio.
     python3 -m rbvor --config ... --replay capture.cu8 --dry-run
     python3 -m rbvor --config ... --freq 109.4 --dry-run   # no bridge needed
     python3 -m rbvor --self-test                           # no hardware needed
+    python3 -m rbvor --devices                             # dongles and allocation
 """
 
 from __future__ import annotations
@@ -34,7 +35,14 @@ from rbvor.controller import Controller
 from rbvor.publisher import HttpTransport, Publisher, RecordingTransport
 from rbvor.record import IQMeta, RingRecorder
 from rbvor.sdnotify import SdNotify
-from rbvor.sdr import SdrError, SdrReader
+from rbvor.sdr import (
+    SdrError,
+    SdrReader,
+    allocate,
+    device_cfg,
+    format_allocation,
+    rtl_serials,
+)
 from rbvor.solutionlog import SolutionLogger
 
 log = logging.getLogger("rbvor")
@@ -63,7 +71,49 @@ async def _run(cfg, args) -> int:
     publisher = Publisher(cfg.publish, transport)
     sd = SdNotify()
     live = args.replay is None
+    gs_on = cfg.gs.enabled
+    listed = bool(cfg.sdr.get("devices"))
     sdr = SdrReader(cfg.sdr) if live else _ReplaySdr()
+
+    # A40: with `sdr.devices` the readers follow the allocation, re-read at
+    # every tune attempt from a released dongle (and by the controller when it
+    # decides an ILS's arrangement), so a dongle plugged in, unplugged, or
+    # freed by the radio is found without a restart. Without the list there is
+    # one dongle, chosen exactly as A27, and the glide slope shares it.
+    gs_reader = None
+    allocate_fn = None
+    if live and listed:
+        gs_reader = SdrReader(cfg.sdr, name="rbvor-sdr-gs") if gs_on else None
+        last_alloc: list = [None]
+
+        def _allocate() -> bool:
+            serials = rtl_serials()
+            a = allocate(cfg.sdr, serials)
+            key = (a.nav, a.gs, a.shared)
+            if key != last_alloc[0]:
+                for line in format_allocation(a, serials):
+                    log.info("%s", line)
+                last_alloc[0] = key
+            sdr.bind(device_cfg(cfg.sdr, a.nav) if a.nav else None,
+                     "no dongle listed in sdr.devices that may serve nav is present")
+            if gs_reader is None:
+                return False
+            if a.gs is not None:
+                gs_reader.bind(device_cfg(cfg.sdr, a.gs))
+                return True
+            gs_reader.bind(None, "no dongle listed in sdr.devices that may serve the "
+                                 "glide slope is present")
+            return not a.shared        # True with no dongle at all: GS is NO_SDR
+
+        sdr.before_open = _allocate
+        if gs_reader is not None:
+            gs_reader.before_open = _allocate
+        allocate_fn = _allocate
+        try:
+            _allocate()
+        except SdrError as e:
+            log.error("%s", e)
+            raise
 
     # M9: forensic logging. Both optional; the controller is identical without
     # them. The solution CSV path comes from config; the IQ recorder is built
@@ -78,6 +128,22 @@ async def _run(cfg, args) -> int:
         recorder = RingRecorder(iq_meta, cfg.record["dir"],
                                 max_seconds=cfg.record["max_seconds"],
                                 fmt=cfg.record["format"])
+    # A46: the glide slope gets its own ring, fed from whichever dongle serves
+    # it (its own, or the nav dongle lent on GS select), so a glide-slope flag
+    # writes the glide-path IQ and the file name carries the glide-path kHz.
+    gs_recorder = None
+    if recorder is not None and getattr(cfg, "gs", None) is not None and cfg.gs.enabled:
+        gs_recorder = RingRecorder(iq_meta, cfg.record["dir"],
+                                   max_seconds=cfg.record["max_seconds"],
+                                   fmt=cfg.record["format"])
+    # A47: sidecars record the gain the samples were really taken at, which
+    # moves under automatic gain (and was simply absent before).
+    if recorder is not None:
+        recorder.gain_source = lambda: getattr(sdr, "gain_db", None)
+    if gs_recorder is not None:
+        gs_recorder.gain_source = lambda: (
+            gs_reader.gain_db if gs_reader is not None and gs_reader.device is not None
+            else getattr(sdr, "gain_db", None))
 
     # 1.0.0: raw per-window decode dump (--csv), the live counterpart of what
     # vor_replay.py writes off a capture, with the tuned channel per row.
@@ -98,6 +164,16 @@ async def _run(cfg, args) -> int:
     if loc_on:
         from rbvor.solutionlog import LOC_FIELDS
         loc_logger = SolutionLogger(cfg.loc.solution_csv, fields=LOC_FIELDS)
+    # A44: and the glide slope its own, for the same reason
+    gs_logger = None
+    gs_obs_sink = None
+    if gs_on:
+        from rbvor.solutionlog import GS_FIELDS
+        gs_logger = SolutionLogger(cfg.gs.solution_csv, fields=GS_FIELDS)
+        if args.csv:
+            from rbvor.obscsv import GsObsCsvSink, gs_path_for
+            gs_obs_sink = GsObsCsvSink(gs_path_for(args.csv))
+            print(f"  glide-slope windows to {gs_obs_sink.path}", flush=True)
 
     # The bridge client is only started when the channel actually comes from the
     # bridge. Bench mode (--freq) and replay both supply the channel themselves,
@@ -114,7 +190,11 @@ async def _run(cfg, args) -> int:
                             sdr_retry_s=(cfg.sdr.get("retry_s", 5.0)
                                          if channel_from_bridge else None),
                             loc_solution_sink=loc_logger.write if loc_logger else None,
-                            loc_obs_sink=loc_obs_sink)
+                            loc_obs_sink=loc_obs_sink,
+                            gs_sdr=gs_reader, allocate=allocate_fn,
+                            gs_solution_sink=gs_logger.write if gs_logger else None,
+                            gs_obs_sink=gs_obs_sink,
+                            gs_recorder=gs_recorder)
 
     if not cfg.calibrated:
         log.warning("bearing calibration is not set: NO bearing will be published. "
@@ -169,7 +249,8 @@ async def _run(cfg, args) -> int:
                               on_disconnect=controller.on_bridge_disconnected,
                               on_gps_track=_set_track,
                               fetch_state=(transport.fetch if isinstance(
-                                  transport, HttpTransport) else None))
+                                  transport, HttpTransport) else None),
+                              on_gs_select=controller.set_gs_select if gs_on else None)
         spawn(client.run(), "bridge")
 
     sd.ready(f"config {cfg.source}")
@@ -184,6 +265,13 @@ async def _run(cfg, args) -> int:
           flush=True)
     loc_txt = "ENABLED (supplemental, not approach guidance)" if loc_on else "disabled"
     print(f"  localizer   {loc_txt}", flush=True)
+    if gs_on:
+        how = ("dedicated dongle when one is listed and present, else shared"
+               if listed else "shares the one dongle: pilot selects LOC / GS")
+        print(f"  glide slope ENABLED (supplemental, not approach guidance); {how}",
+              flush=True)
+    else:
+        print("  glide slope disabled", flush=True)
     print(f"  mode        {'replay' if args.replay else ('bench' if args.freq else 'bridge')}"
           f"{'  (dry-run)' if args.dry_run else ''}", flush=True)
     if _threadcaps._CHANGED:
@@ -191,8 +279,20 @@ async def _run(cfg, args) -> int:
               f"({len(_threadcaps._CHANGED)} vars)", flush=True)
     print("-" * 64, flush=True)
 
+    def _gs_bit(rx) -> str:
+        if rx is None or rx.channel_khz is None:
+            return ""
+        dev = (f"{rx.ddm:+.4f}" if rx.ddm is not None
+               and rx.state in ("TRACKING", "DEGRADED") else "  ---  ")
+        lo = rx.last_obs
+        meas = (f"sdm {lo.sdm:.3f} snr {lo.snr_db:4.1f} dB"
+                if lo is not None else "sdm -- snr --")
+        return f"GS {rx.channel_khz/1000:.2f} [{rx.state}] ddm {dev} {meas}"
+
     def _status_line() -> str:
         c = controller
+        if c.mode == "gs":
+            return f"[{c.state:11s}] {c.channel_khz/1000:.3f} MHz  (shared)  {_gs_bit(c.gs_rx)}"
         if c.mode == "loc":
             lq, lo = c._last_loc_q, c._last_loc_obs
             ch = f"{c.channel_khz/1000:.3f}" if c.channel_khz else "-----"
@@ -200,8 +300,9 @@ async def _run(cfg, args) -> int:
                    and c.state in ("TRACKING", "DEGRADED") else "  ---  ")
             meas = (f"sdm {lo.sdm:.3f} snr {lo.snr_db:4.1f} dB eps {100*lo.tone_offset:+.2f}%"
                     if lo is not None else "sdm -- snr -- eps --")
+            gsb = _gs_bit(c.gs_rx) if c.gs_enabled and c._gs_dedicated else ""
             return (f"[{c.state:11s}] {ch} MHz  LOC ddm {dev}  sig "
-                    f"{lq.value if lq else 0:3d}  {meas}")
+                    f"{lq.value if lq else 0:3d}  {meas}" + (f"  | {gsb}" if gsb else ""))
         q = c._last_q
         bearing = ("---" if c._last_good is None or c.state in
                    ("IDLE", "TUNING", "INVALID_FREQ") else f"{c._last_good:3d}\u00b0")
@@ -214,6 +315,8 @@ async def _run(cfg, args) -> int:
             s = sdr.stats
             sdr_bit = (f" | sdr blk {s['blocks_read']} ovr {s['overruns']} "
                        f"err {s['read_errors']} q {s['queued']}")
+            if s.get("gain_db") is not None:
+                sdr_bit += f" gain {s['gain_db']:g} dB"
         o = getattr(c, "_last_obs", None)
         afc = (f"  afc {o.carrier_offset_hz:+.0f} Hz"
                if o is not None and abs(o.carrier_offset_hz) >= 50 else "")
@@ -247,8 +350,16 @@ async def _run(cfg, args) -> int:
                 for block, gap in sdr.blocks():
                     controller.push(block, gap=gap)
                     got = True
+                if gs_reader is not None:
+                    # F5's bound holds per reader: each yields at most what was
+                    # queued on entry, so neither starves the other or the loop
+                    for block, gap in gs_reader.blocks():
+                        controller.push_gs(block, gap=gap)
+                        got = True
                 if loop.time() - last_report >= 30.0:
                     log.info("sdr %s", sdr.stats)
+                    if gs_reader is not None:
+                        log.info("sdr gs %s", gs_reader.stats)
                     last_report = loop.time()
                 await asyncio.sleep(0.0 if got else 0.02)
         spawn(pump(), "pump")
@@ -263,7 +374,18 @@ async def _run(cfg, args) -> int:
                             "carrier on the wrong side of centre; set sdr.swap_iq "
                             "for this file or regenerate it", args.replay)
             if args.freq is None:
-                controller.set_channel(meta.nav_freq_hz / 1e6)
+                from rbvor.freqrules import GS_PAIRING_KHZ
+                gs_khz = int(round(meta.nav_freq_hz / 1000))
+                loc_khz = {g: k for k, g in GS_PAIRING_KHZ.items()}.get(gs_khz)
+                if loc_khz is not None and gs_on:
+                    # A44: a glide-path capture replays as its ILS with the
+                    # glide slope selected on the one (replay) receiver
+                    log.info("replay: glide path %.2f MHz = ILS %.2f MHz, GS selected",
+                             gs_khz / 1000, loc_khz / 1000)
+                    controller.set_channel(loc_khz / 1000)
+                    controller.set_gs_select(1)
+                else:
+                    controller.set_channel(meta.nav_freq_hz / 1e6)
             for _ in range(12):
                 controller.tick()
                 await asyncio.sleep(0.1)
@@ -294,6 +416,13 @@ async def _run(cfg, args) -> int:
         if live:
             sdr.close()
             log.info("sdr final %s", sdr.stats)
+        if gs_reader is not None:
+            gs_reader.close()
+            log.info("sdr gs final %s", gs_reader.stats)
+        if gs_logger is not None:
+            gs_logger.close()
+        if gs_obs_sink is not None:
+            gs_obs_sink.close()
         sol_logger.close()
         if loc_logger is not None:
             loc_logger.close()
@@ -302,6 +431,8 @@ async def _run(cfg, args) -> int:
         if obs_sink is not None:
             obs_sink.close()
             log.info("wrote %d rows to %s", obs_sink.rows, args.csv)
+        if gs_recorder is not None:
+            gs_recorder.flush(timeout=10.0)
         if recorder is not None:
             recorder.flush(timeout=10.0)     # let a capture in flight finish its sidecar
         if isinstance(transport, HttpTransport):
@@ -324,6 +455,9 @@ def main(argv=None) -> int:
                     help="fix the channel in MHz and ignore the bridge (bench mode)")
     ap.add_argument("--dry-run", action="store_true",
                     help="log payloads instead of POSTing them")
+    ap.add_argument("--devices", action="store_true",
+                    help="list the RTL-SDRs present and the allocation this config "
+                         "would make (nav / glide slope), then exit")
     ap.add_argument("--self-test", action="store_true",
                     help="run the full chain on a synthetic signal and exit")
     ap.add_argument("--csv", type=Path, default=None,
@@ -349,6 +483,19 @@ def main(argv=None) -> int:
     except ConfigError as e:
         print(f"configuration error: {e}", file=sys.stderr)
         return 2
+
+    if args.devices:
+        serials = rtl_serials()
+        try:
+            a = allocate(cfg.sdr, serials)
+        except SdrError as e:
+            print(f"allocation error: {e}", file=sys.stderr)
+            return 3
+        print("\n".join(format_allocation(a, serials)))
+        print("glide slope " + ("enabled" if cfg.gs.enabled else "disabled (gs.enabled)"))
+        print("(tuner type is logged when a dongle is opened; opening one here could "
+              "take it from Stratux or rb-sdr-radio)")
+        return 0
 
     logging.basicConfig(
         level=args.log_level or cfg.log["level"],

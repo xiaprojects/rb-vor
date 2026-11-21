@@ -51,12 +51,14 @@ image to a decoded 109.40 MHz bearing.
 | A22 offset-convention fix, F3/F5 daemon-liveness fixes, D6 hot-path 3.5× | done |
 | A25 signal chain (filters, 2 s windows, AFC), D7 harmonic estimator (opt-in) | done, 550 tests green — bearing RMS halved, 4× at low SNR with D7 |
 | ILS localizer, phase A (L0–L6): `loc.py`, `loc_gen.py`, `loc_sweep.py`, interface v2.3 | done on synthetic signals, **ships disabled** (`loc.enabled: false`) until a real localizer has been decoded (L7) — see [`docs/loc-sweep.md`](docs/loc-sweep.md) |
+| ILS glide slope, phase A (G0–G7): `gs.py`, `gs_gen.py`, `gs_sweep.py`, `sdr.devices` allocation, interface v2.4 | done on synthetic signals, **ships disabled** (`gs.enabled: false`) until a real glide slope has been decoded (G8) — see [`docs/gs-sweep.md`](docs/gs-sweep.md) and [`docs/gs-plan.md`](docs/gs-plan.md) |
 | M10 field campaign | **in progress** — an orbit was flown (see `CLAUDE.md`, "Field campaign"); the GPS-referenced evidence is not yet in the tree (O14) |
 
 Everything except the field campaign is implemented. The interface is
-**RB-VOR-IF v2.3** ([`docs/RB-VOR-IF-v2.3.md`](docs/RB-VOR-IF-v2.3.md)); v2.3
-adds the localizer fields and is byte-for-byte v2.2 while `loc.enabled` is
-false. v1.0 to v2.2 are retained for reference. See [`CHANGELOG.md`](CHANGELOG.md) for
+**RB-VOR-IF v2.4** ([`docs/RB-VOR-IF-v2.4.md`](docs/RB-VOR-IF-v2.4.md)); v2.4
+adds the glide-slope fields and is byte-for-byte v2.3 while `gs.enabled` is
+false, and v2.3 (the localizer) is byte-for-byte v2.2 while `loc.enabled` is
+false. v1.0 to v2.3 are retained for reference. See [`CHANGELOG.md`](CHANGELOG.md) for
 measured performance and known limitations.
 
 > **An uncalibrated config publishes no bearing** — `vorradial` stays 0 and
@@ -198,8 +200,8 @@ an optional keep-alive, `publish.keepalive_s`):
 
 No field is zeroed for validity (1.0.0): a field is 0 only when nothing has been
 measured since the last retune. Full spec:
-[`docs/RB-VOR-IF-v2.3.md`](docs/RB-VOR-IF-v2.3.md) (supersedes doc A §10 and
-v2.2).
+[`docs/RB-VOR-IF-v2.4.md`](docs/RB-VOR-IF-v2.4.md) (supersedes doc A §10 and
+v2.3).
 Additive fields only within v2.x.
 
 ### ILS localizer (v2.3, disabled by default)
@@ -220,9 +222,31 @@ On a localizer channel every `vor*` field is 0, so a v2.2 consumer shows OFF,
 never a radial. **Do not draw a deviation bar unless `locstatus >= 4`**: noise
 decodes as a centred needle, and a killed daemon leaves its last values on the
 bridge. Supplemental equipment, not approach guidance; a back course reads
-reversed and the receiver cannot know. Glide slope, markers and DME are not
-supported. Accuracy, validity and the noise-only result are measured in
+reversed and the receiver cannot know. Markers and DME are not supported.
+Accuracy, validity and the noise-only result are measured in
 [`docs/loc-sweep.md`](docs/loc-sweep.md) on synthetic signals only.
+
+### ILS glide slope (v2.4, disabled by default)
+
+With `"gs": {"enabled": true}` (which requires `loc.enabled`), picking a
+localizer also selects its paired glide path (329.15–335.00 MHz; the 40-row
+table is in the spec). A dongle hears about 1 MHz and the two are 220 MHz
+apart, so:
+
+- **two dongles** listed in `sdr.devices`: localizer and glide slope are
+  received together;
+- **one dongle**: the localizer is received, and the plate offers a LOC / GS
+  switch (`gsselect`); the half not selected shows *nothing*, never its last
+  value.
+
+Seven more fields: `gsstatus` (`>= 4` usable), `gsdev` (% of full scale, DDM
+0.175 = 100, **+ = 150 Hz = below the path = fly up**, 0 unless usable),
+`gsddm`, `gssdm` (nominal 80), `gssnr`, `gsfreqactive`, and `gsshared` (1 when
+the switch is needed). **Do not draw the glide-slope marker unless
+`gsstatus >= 4`.** A glide path radiates false paths above the true one, a
+localizer may have no glide path at all, and neither can be detected.
+Supplemental equipment, **not approach guidance**. Measured on synthetic
+signals only: [`docs/gs-sweep.md`](docs/gs-sweep.md).
 
 ---
 

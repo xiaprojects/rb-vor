@@ -18,6 +18,7 @@ soldering iron, a 3D printer, and no lab equipment.
 | 5 | Coax | RG-316 SMA–SMA 1 m | RG-58 + BNC adapter | keep short |
 | 6 | Ferrites | clip-on 5 mm × 4 | — | one per USB and coax end |
 | 7 | USB isolator | USB 2.0 galvanic isolator | ferrite on the USB lead | optional |
+| 8 | Second SDR dongle (glide slope) | as item 1 | — | **optional**: only to receive localizer and glide slope together (`sdr.devices`, RUN.md); with one dongle the pilot switches. Item 3 (an airband filter) would block 330 MHz; whether items 2 and 4 pass it is unmeasured (open item O33) |
 
 The band-stop filter is not optional. 108.000 MHz sits directly above the FM
 broadcast band; without it the RTL front end desensitises or produces images on

@@ -26,11 +26,12 @@ from typing import Any
 
 from rbvor.bearing import BearingCal
 from rbvor.dsp import INTERMEDIATE_HZ, DspParams
+from rbvor.gs import GsDspParams, GsQualityParams
 from rbvor.loc import LocDspParams, LocQualityParams
 from rbvor.quality import QualityParams
 
 __all__ = ["Config", "ConfigError", "load", "DEFAULT_PATHS", "SCHEMA_PATH",
-           "LocSettings", "LOC_DEFAULTS"]
+           "LocSettings", "LOC_DEFAULTS", "GsSettings", "GS_DEFAULTS"]
 
 log = logging.getLogger("rbvor.config")
 
@@ -61,6 +62,32 @@ LOC_DEFAULTS: dict[str, Any] = {
     "tone_search": 0.03,
     "smooth_n": 1,
 }
+
+
+#: AMENDMENT A39-A45: the `gs` block is optional for A33's reason. Window,
+#: acquisition and quality figures are the glide-slope sweep's
+#: (docs/gs-sweep.md), not the localizer's carried over.
+GS_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "integration_s": 1.0,
+    "hop_s": 0.5,
+    "tone_search": 0.03,
+    "smooth_n": 1,
+    "acquire_hz": 30_000.0,
+    "acquire_min_db": 20.0,
+}
+
+
+@dataclass(frozen=True)
+class GsSettings:
+    """Typed view of the optional `gs` block (A39)."""
+
+    enabled: bool
+    dsp: GsDspParams
+    quality: GsQualityParams
+    smooth_n: int
+    solution_csv: str | None
+    retry_s: float
 
 
 @dataclass(frozen=True)
@@ -186,6 +213,32 @@ class Config:
             solution_csv=csv_path,
         )
 
+    @property
+    def gs(self) -> GsSettings:
+        """The glide-slope settings; disabled defaults when the block is absent."""
+        raw = self.raw.get("gs") or {}
+        v = {**GS_DEFAULTS, **{k: raw[k] for k in GS_DEFAULTS if k in raw}}
+        q = dict(raw.get("quality") or {})
+        q.pop("_note", None)
+        if "weights" in q:
+            q["weights"] = dict(q["weights"])
+        if "solution_csv" in raw:
+            csv_path = raw["solution_csv"] or None
+        else:
+            vor_csv = (self.raw.get("log") or {}).get("solution_csv")
+            csv_path = str(Path(vor_csv).with_name("gs.csv")) if vor_csv else None
+        return GsSettings(
+            enabled=bool(v["enabled"]),
+            dsp=GsDspParams.from_dsp(self.dsp, integration_s=v["integration_s"],
+                                     hop_s=v["hop_s"], tone_search=v["tone_search"],
+                                     acquire_hz=v["acquire_hz"],
+                                     acquire_min_db=v["acquire_min_db"]),
+            quality=GsQualityParams(**q),
+            smooth_n=int(v["smooth_n"]),
+            solution_csv=csv_path,
+            retry_s=float(raw.get("retry_s", self.raw["sdr"].get("retry_s", 5.0))),
+        )
+
 
 def _validate_schema(data: dict) -> None:
     try:
@@ -216,6 +269,23 @@ def _validate_relationships(d: dict) -> None:
         _fail("['sdr']['tuner_offset_hz']",
               "must be inside +/- fs/2, otherwise the carrier falls outside the "
               "sampled band")
+
+    # A47: automatic gain, in the sdr block and in any tuner profile
+    blocks = [("['sdr']['auto_gain']", sdr.get("auto_gain"))]
+    blocks += [(f"['sdr']['tuner_profiles'][{t!r}]['auto_gain']", p.get("auto_gain"))
+               for t, p in (sdr.get("tuner_profiles") or {}).items()]
+    for path, ag in blocks:
+        if not ag:
+            continue
+        if ag["min_db"] > ag["max_db"]:
+            _fail(path, f"min_db {ag['min_db']} exceeds max_db {ag['max_db']}")
+        if ag.get("clip_max_pct", 1.0) > ag.get("clip_severe_pct", 5.0):
+            _fail(path, "clip_max_pct must not exceed clip_severe_pct")
+        if ag.get("rms_low_counts", 4.0) >= ag.get("rms_high_counts", 20.0):
+            _fail(path, "rms_low_counts must be below rms_high_counts")
+    if (sdr.get("auto_gain") or {}).get("enabled") and sdr["gain_mode"] == "agc":
+        log.warning("config['sdr']['auto_gain'] is enabled but gain_mode is \"agc\" "
+                    "(the tuner's own): automatic gain will be ignored")
 
     if dsp["subcarrier_hz"] + dsp["sub_lp_hz"] > INTERMEDIATE_HZ / 2:
         _fail("['dsp']['sub_lp_hz']",
@@ -249,6 +319,11 @@ def _validate_relationships(d: dict) -> None:
         _fail("['bearing']",
               "phase_sign and phase_offset_deg must both be set or both be null "
               "(amendment A2); run tools/vor_calibrate.py")
+
+    if (d.get("gs") or {}).get("enabled") and not (d.get("loc") or {}).get("enabled"):
+        _fail("['gs']['enabled']",
+              "the glide slope is selected through its localizer: gs.enabled requires "
+              "loc.enabled (both true, or set gs.enabled false)")
 
     w = d["quality"]["weights"]
     total = sum(w.values())
@@ -289,7 +364,7 @@ def load(path: str | Path | None = None) -> Config:
     # QualityParams and BearingCal all enforce their own invariants.
     cfg = Config(raw=data, source=p)
     try:
-        _ = (cfg.dsp, cfg.bearing, cfg.quality, cfg.loc)
+        _ = (cfg.dsp, cfg.bearing, cfg.quality, cfg.loc, cfg.gs)
     except ValueError as e:
         raise ConfigError(f"{p}: {e}") from e
     return cfg

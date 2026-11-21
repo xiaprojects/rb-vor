@@ -288,6 +288,66 @@ windows the validity check accepts.
 Not approach guidance. A back course reads reversed. `locdev` is 0 unless
 `locstatus >= 4`; a consumer must not draw a deviation from anything else.
 
+## ILS glide slope, and more than one dongle (disabled by default)
+
+Glide-slope decoding (CLAUDE.md A39–A45, RB-VOR-IF v2.4) ships off and needs
+the localizer on: `"loc": {"enabled": true}, "gs": {"enabled": true}`. It has
+been measured only on synthetic signals (`docs/gs-sweep.md`). On a bench:
+
+```bash
+# a glide path half a sector low (fly up), carrier at the 0.005 % limit
+python3 tools/gs_gen.py --ddm 0.0875 --drift-hz 16750 --nav-freq 332.6 -o gs
+python3 tools/vor_replay.py gs.cu8           # picks the glide-slope path from 332.6 MHz
+```
+
+**One dongle** is enough: the glide slope shares it and the pilot switches
+LOC / GS on the plate. **Two dongles** receive both together. List them, in
+order of preference, by serial — give each a name once:
+
+```bash
+rtl_eeprom -d <n> -s rbnav1                         # replug afterwards
+rtl_eeprom -d <m> -s rbgs1
+```
+
+```json
+"sdr": {
+  "devices": [
+    { "device_serial": "rbnav1", "use": ["nav", "gs"] },
+    { "device_serial": "rbgs1",  "use": ["gs"], "gain_db": 32.8 }
+  ]
+}
+```
+
+`use` says what each dongle's antenna and filters can serve (`nav` = VOR and
+localizer). The first present entry allowing `nav` takes it, the first
+*other* one allowing `gs` takes the glide slope, and with none the glide slope
+shares the nav dongle. A listed dongle that is absent is a warning, not an
+error; a dongle that is **not** listed is never opened — it belongs to Stratux
+or the radio. Per-entry `gain_db`, `ppm`, `swap_iq`, `bias_tee` win over
+`tuner_profiles`. Check what the config would do, without opening anything:
+
+```bash
+python3 -m rbvor --config /etc/rb-vor/rb-vor.json --devices
+```
+
+```
+3 RTL-SDR device(s) present: 0:stratux:1090, 1:rbgs1, 2:rbnav1
+allocation (sdr.devices list):
+  nav (VOR / localizer): serial 'rbnav1' (index 2)
+  glide slope:           serial 'rbgs1' (index 1) (dedicated)
+```
+
+The allocation is re-read at every retune, so a dongle plugged in later (or
+freed by the radio) is used at the next station pick or switch. Whether your
+antenna and FM band-stop filter pass 330 MHz at all is the first thing to
+measure (`docs/gs-plan.md` section 9, O33): capture 10 s on a glide-path
+channel and look for a carrier with `vor_replay.py --survey`. RB-01 hands any
+dongle without a `stratux:` serial to traffic reception (O38) — mind that when
+naming them.
+
+Not approach guidance. `gsdev` is 0 unless `gsstatus >= 4`; a consumer must
+not draw the marker from anything else.
+
 ## 7. RTL-SDR Blog V4
 
 The V4's R828D tuner needs the rtl-sdr-blog fork of `librtlsdr`. On the stock

@@ -61,7 +61,7 @@ __all__ = ["ParsedFrame", "parse_frame", "BridgeClient", "enable_tcp_keepalive"]
 log = logging.getLogger("rbvor.bridge")
 
 #: Fields we consume. Everything else in the bridge state is not our business.
-CONSUMED = ("vorfreq", "gpsTrack")
+CONSUMED = ("vorfreq", "gpsTrack", "gsselect")
 
 #: How long a close waits for the peer's close frame. RB-01 never sends one, so
 #: this is pure delay on every stop: the library default is 10 s, and the legacy
@@ -87,6 +87,8 @@ class ParsedFrame:
 
     vorfreq: float | None = None
     gps_track: float | None = None
+    #: RB-VOR-IF v2.4 (A44): the pilot's LOC (0) / GS (1) switch; None absent
+    gs_select: int | None = None
     error: str | None = None
     raw_keys: tuple[str, ...] = ()
 
@@ -118,6 +120,12 @@ def parse_frame(text: str | bytes) -> ParsedFrame:
         return ParsedFrame(error=f"expected an object, got {type(data).__name__}")
 
     track = _num(data["gpsTrack"]) if "gpsTrack" in data else None
+    sel = None
+    if "gsselect" in data:
+        g = _num(data["gsselect"])
+        # junk in this key is not a reason to drop the frame's vorfreq: it is
+        # read as "absent" and the controller logs nothing it cannot act on
+        sel = int(g) if g is not None and g in (0.0, 1.0) else None
     freq = None
     # Three distinct cases, and conflating any two of them is a bug:
     #   absent  -> no change, keep the current channel
@@ -130,7 +138,7 @@ def parse_frame(text: str | bytes) -> ParsedFrame:
             return ParsedFrame(gps_track=track, raw_keys=tuple(data),
                                error=f"vorfreq is not a number: "
                                      f"{data['vorfreq']!r}")
-    return ParsedFrame(vorfreq=freq, gps_track=track, raw_keys=tuple(data))
+    return ParsedFrame(vorfreq=freq, gps_track=track, gs_select=sel, raw_keys=tuple(data))
 
 
 def enable_tcp_keepalive(sock) -> bool:
@@ -171,13 +179,15 @@ class BridgeClient:
                  on_connect: Callable[[], None] | None = None,
                  on_disconnect: Callable[[], None] | None = None,
                  on_gps_track: Callable[[float], None] | None = None,
-                 fetch_state: Callable[[], Awaitable[str]] | None = None):
+                 fetch_state: Callable[[], Awaitable[str]] | None = None,
+                 on_gs_select: Callable[[int], None] | None = None):
         self.cfg = cfg_bridge
         self.on_channel = on_channel
         self.on_connect = on_connect
         self.on_disconnect = on_disconnect
         self.on_gps_track = on_gps_track
         self.fetch_state = fetch_state
+        self.on_gs_select = on_gs_select
         self.connected = False
         self.frames = 0
         self.bad_frames = 0
@@ -198,6 +208,11 @@ class BridgeClient:
             self.on_gps_track(f.gps_track)
         if "vorfreq" in f.raw_keys:
             self.on_channel(f.vorfreq)
+        # After vorfreq, on purpose: a new station resets the selection to the
+        # localizer, and a gsselect in the same frame (a restart reading the
+        # state back, A31) then restores the pilot's choice (A44).
+        if f.gs_select is not None and self.on_gs_select is not None:
+            self.on_gs_select(f.gs_select)
         return f
 
     async def run(self) -> None:

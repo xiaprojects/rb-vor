@@ -80,10 +80,49 @@ Schema `rb-vor.loc-solution/1`.
 | `overrun` | bool | window touched a sample gap |
 | `iq_ref` | filename | IQ capture that includes this window, if any |
 
+## Glide-slope records (A44)
+
+With `gs.enabled`, glide-slope solutions go to their own local CSV (`gs.solution_csv`, default `gs.csv` beside `log.solution_csv`), generated from `rbvor.solutionlog.GS_SOLUTION_SCHEMA`, for the localizer's reason. A row is written on every glide-slope event: a window decoded, a state change, a switch on a shared receiver. It carries the paired localizer channel and whether the receiver was shared, so a flight log can tell 'no glide path' from 'glide slope not selected'. The privacy note below applies to it unchanged. IQ recording (below) covers the nav receiver only: a second ring would cost another 61 MB (D6), and on a shared receiver with the glide slope selected nothing is recorded.
+
+Schema `rb-vor.gs-solution/1`.
+
+| field | unit | description |
+|---|---|---|
+| `t_utc` | ISO-8601 | wall-clock time the solution was produced |
+| `t_mono` | s | monotonic time of the publish |
+| `channel_khz` | kHz | tuned glide-path channel, integer |
+| `loc_channel_khz` | kHz | selected localizer channel it is paired with |
+| `state` | enum | glide-slope receiver state: TRACKING/DEGRADED/NO_SIGNAL/... |
+| `gsstatus` | 0-5 | published status code, >= 4 usable |
+| `ddm` | DDM | published DDM (smoothed, compression-corrected, A42), empty when not usable; + = 150 Hz predominates = below the path = fly up |
+| `valid` | bool | true when gsstatus >= 4 |
+| `shared` | bool | localizer and glide slope share one receiver (gsshared) |
+| `reason` | text | human-readable state/flag reason |
+| `q_sdm` | 0-1 | SDM quality term (SDM / 0.80) |
+| `q_snr` | 0-1 | tone SNR quality term |
+| `q_stab` | 0-1 | DDM steadiness about its trend |
+| `value` | 0-100 | internal glide-slope quality score; 0 = flagged |
+| `m90` | frac | 90 Hz depth, nominal 0.40 |
+| `m150` | frac | 150 Hz depth, nominal 0.40 |
+| `ddm_raw` | DDM | m150 - m90 of the last window, before correction |
+| `ddm_corrected` | DDM | raw DDM x max(1, 0.80 / SDM), before smoothing |
+| `sdm` | frac | m90 + m150, nominal 0.80 |
+| `snr_db` | dB | mean tone amplitude against the off-tone bins |
+| `tone_offset` | frac | found fractional tone-frequency offset (A34) |
+| `carrier` | a.u. | smoothed carrier magnitude |
+| `carrier_offset_hz` | Hz | carrier offset from the nominal down-mix; ppm = value / channel_khz / 1000 (three times as sensitive as VOR) |
+| `acquired_hz` | Hz | coarse carrier search result before the channel filter (A41) |
+| `gps_track` | deg true | aircraft track from the bridge, diagnostics only |
+| `overrun` | bool | window touched a sample gap |
+| `iq_ref` | filename | glide-slope IQ capture that includes this window, if any (A46) |
+
 ## IQ captures
 
 When `record.trigger` is `on_flag`, the IQ that produced a NAV flag is written
-alongside the solution stream and named in that solution's `iq_ref`. These files
+alongside the solution stream and named in that solution's `iq_ref`. The glide
+slope has its own ring (A46): a glide-slope flag writes the glide-path IQ,
+named by the glide-path channel (`capture_<utc>_332600.cu8`), and `gs.csv`'s
+`iq_ref` names it. With two receivers both rings can write at once. These files
 are large; they are uploaded on a slower path (or on request) and pruned locally
 by `record.max_seconds` and disk budget. A capture carries a full sidecar
 (`rbvor.record.IQMeta`), including site and antenna context when present.

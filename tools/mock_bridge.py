@@ -11,8 +11,13 @@ connections, HTTP 500s, and a slow endpoint.
     ./mock_bridge.py --fail-rate 0.3 --slow 1.5
     ./mock_bridge.py --script "109.4@0,109.5@8,0@16"     # VOR, localizer, OFF
 
-Validates RB-VOR-IF v2.2 payloads, and v2.3 ones (the six loc* keys, sent when
-the receiver has loc.enabled). Like RB-01, OFF may be posted as 0.
+Validates RB-VOR-IF v2.2 payloads, v2.3 ones (the six loc* keys, sent when
+the receiver has loc.enabled) and v2.4 ones (plus the seven gs* keys, with
+gs.enabled). Like RB-01, OFF may be posted as 0.
+
+The pilot's LOC / GS switch (v2.4, CLAUDE.md A44) is scripted as `gs=<0|1>`:
+
+    ./mock_bridge.py --script "109.5@0,gs=1@10,gs=0@20"   # ILS, then GS, then LOC
 """
 
 from __future__ import annotations
@@ -31,13 +36,34 @@ RECEIVED: list[dict] = []
 
 
 def parse_script(text: str) -> list[tuple[float, float | None]]:
-    """`"109.4@0,113.35@8,null@16"` -> [(0.0, 109.4), (8.0, 113.35), (16.0, None)]."""
+    """`"109.4@0,113.35@8,null@16"` -> [(0.0, 109.4), (8.0, 113.35), (16.0, None)].
+    `gs=` items are the pilot's switch and are left to `parse_gs_script`."""
     out = []
     for item in filter(None, (x.strip() for x in text.split(","))):
+        if item.lower().startswith("gs="):
+            continue
         value, _, when = item.partition("@")
         freq = None if value.lower() in ("null", "none", "") else float(value)
         out.append((float(when or 0.0), freq))
     return sorted(out)
+
+
+def parse_gs_script(text: str) -> list[tuple[float, int]]:
+    """`"109.5@0,gs=1@10,gs=0@20"` -> [(10.0, 1), (20.0, 0)]."""
+    out = []
+    for item in filter(None, (x.strip() for x in text.split(","))):
+        if item.lower().startswith("gs="):
+            value, _, when = item[3:].partition("@")
+            out.append((float(when or 0.0), int(value)))
+    return sorted(out)
+
+
+def _scripted(script, now, default):
+    cur = default
+    for when, v in script:
+        if when <= now:
+            cur = v
+    return cur
 
 
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
@@ -61,6 +87,9 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
             state = {"vorfreq": current, "gpsTrack": round(track, 1),
                      "vorradial": 0, "vorsnr": 0, "voram": 0, "vorstatus": 0,
                      "vorsub": 0, "vorfreqactive": 0}
+            gs_script = request.app.get("gs_script") or []
+            if gs_script:
+                state["gsselect"] = _scripted(gs_script, now, 0)
             await ws.send_str(json.dumps(state))
             await asyncio.sleep(period)
     except (ConnectionResetError, asyncio.CancelledError):
@@ -70,9 +99,14 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
 
 
 async def state_handler(request: web.Request) -> web.Response:
-    """Answers the read the daemon makes on connect (CLAUDE.md A31). Nothing to
-    report: unlike RB-01, this socket re-asserts `vorfreq` every period anyway."""
-    return web.json_response({})
+    """Answers the read the daemon makes on connect (CLAUDE.md A31). Unlike
+    RB-01 this socket re-asserts `vorfreq` every period anyway, so only the
+    pilot's switch is reported, when one is scripted (v2.4)."""
+    gs_script = request.app.get("gs_script") or []
+    if not gs_script:
+        return web.json_response({})
+    now = time.monotonic() - request.app["t0"]
+    return web.json_response({"gsselect": _scripted(gs_script, now, 0)})
 
 
 async def update_handler(request: web.Request) -> web.Response:
@@ -98,15 +132,27 @@ VOR_KEYS = {"vorradial", "vorsnr", "voram", "vorstatus", "vorsub", "vorfreqactiv
 #: RB-VOR-IF v2.3 (CLAUDE.md A33): present, all six, exactly when the receiver
 #: has loc.enabled; absent otherwise.
 LOC_KEYS = {"locstatus", "locdev", "locddm", "locsdm", "locsnr", "locfreqactive"}
+#: RB-VOR-IF v2.4 (CLAUDE.md A44): present, all seven, exactly when the receiver
+#: has gs.enabled (which requires loc.enabled); absent otherwise.
+GS_KEYS = {"gsstatus", "gsdev", "gsddm", "gssdm", "gssnr", "gsfreqactive", "gsshared"}
+#: The 40 glide-path channels, kHz: 329150..335000 on a 150 kHz grid.
+GS_CHANNELS = frozenset(range(329_150, 335_001, 150))
 
 
 def validate(body: dict) -> list[str]:
-    """Every deviation of one POST body from RB-VOR-IF v2.2 / v2.3 section 3."""
+    """Every deviation of one POST body from RB-VOR-IF v2.2 / v2.3 / v2.4 section 3."""
     problems = []
-    expect = VOR_KEYS | LOC_KEYS if LOC_KEYS & set(body) else VOR_KEYS
-    if set(body) != expect:
+    keys = set(body)
+    if GS_KEYS & keys:
+        expect = VOR_KEYS | LOC_KEYS | GS_KEYS
+    elif LOC_KEYS & keys:
+        expect = VOR_KEYS | LOC_KEYS
+    else:
+        expect = VOR_KEYS
+    if keys != expect:
         problems.append(f"payload keys are {sorted(body)}, expected "
-                        f"{sorted(expect)} exactly (v2.2 six, or v2.3 twelve)")
+                        f"{sorted(expect)} exactly (v2.2 six, v2.3 twelve or v2.4 "
+                        "nineteen)")
     for k in expect:
         if k in body and not isinstance(body[k], int):
             problems.append(f"{k} is {type(body[k]).__name__}, expected int")
@@ -147,6 +193,44 @@ def validate(body: dict) -> list[str]:
             problems.append("on a localizer channel every vor* field must be 0 (v2.3 3.8)")
         if not lf and ls:
             problems.append(f"locstatus {ls} with locfreqactive 0")
+    for k in GS_KEYS & set(body):
+        if not isinstance(body[k], int) or isinstance(body[k], bool):
+            problems.append(f"{k} is {type(body[k]).__name__}, expected int")
+    if not problems and set(body) >= GS_KEYS:
+        problems += _validate_gs(body)
+    return problems
+
+
+def _validate_gs(body: dict) -> list[str]:
+    """The v2.4 cross-field rules (CLAUDE.md A44)."""
+    problems = []
+    gs, dev, gf, sh = body["gsstatus"], body["gsdev"], body["gsfreqactive"], body["gsshared"]
+    lf = body["locfreqactive"]
+    if gs not in range(6):
+        problems.append(f"gsstatus {gs} not in 0..5")
+    if not -100 <= dev <= 100:
+        problems.append(f"gsdev {dev} out of range -100..100")
+    if dev != 0 and gs < 4:
+        problems.append(f"gsdev {dev} with gsstatus {gs}: must be 0 unless usable")
+    if not 0 <= body["gssdm"] <= 100:
+        problems.append(f"gssdm {body['gssdm']} out of range 0..100")
+    if not 0 <= body["gssnr"] <= 120:
+        problems.append(f"gssnr {body['gssnr']} out of range 0..120 dB")
+    if sh not in (0, 1):
+        problems.append(f"gsshared {sh} not 0 or 1")
+    if gf != 0 and gf not in GS_CHANNELS:
+        problems.append(f"gsfreqactive {gf} not 0 or a glide-path channel")
+    if not gf and gs:
+        problems.append(f"gsstatus {gs} with gsfreqactive 0")
+    if gf and body["vorfreqactive"]:
+        problems.append("vorfreqactive and gsfreqactive both non-zero")
+    if gf and any(body[k] for k in VOR_KEYS):
+        problems.append("with a glide path tuned every vor* field must be 0")
+    if sh and gf and lf:
+        problems.append("gsshared 1 with locfreqactive and gsfreqactive both non-zero: "
+                        "one receiver hears one of them")
+    if sh and body["vorfreqactive"]:
+        problems.append("gsshared 1 on a VOR channel")
     return problems
 
 
@@ -160,6 +244,8 @@ def build(args) -> web.Application:
     app["period"] = args.period
     app["fail_rate"] = args.fail_rate
     app["slow"] = args.slow
+    app["gs_script"] = parse_gs_script(args.script)
+    app["t0"] = time.monotonic()
     app.router.add_get("/bridge", ws_handler)
     app.router.add_get("/bridgeUpdate", state_handler)
     app.router.add_post("/bridgeUpdate", update_handler)

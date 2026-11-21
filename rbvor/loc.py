@@ -207,6 +207,10 @@ class LocObservation:
 class LocDemod:
     """Block-processing localizer demodulator. Same calling shape as VorDemod."""
 
+    #: The record `_emit` builds. `rbvor.gs.GsDemod` substitutes its own, whose
+    #: derived DDMs use the glide path's nominal SDM (A39).
+    obs_cls = LocObservation
+
     # The VOR front end, reused by reference rather than copied (plan section
     # 6). These read only p.fs, p.offset_hz, p.afc_threshold_hz, p.afc_tau_s
     # and the mixer/AFC attributes initialised in `reset()`.
@@ -363,7 +367,7 @@ class LocDemod:
             else:
                 # mean |X|^2 per bin in the noise bins, unscaled
                 m90, m150, eps = self._band(seg, float(np.mean(np.abs(nb) ** 2)))
-            out.append(LocObservation(
+            out.append(self.obs_cls(
                 t=float((self._out_n + w / 2.0) / TONE_RATE_HZ),
                 m90=m90, m150=m150, tone_offset=eps,
                 carrier=float(np.mean(self._buf_c[:w])) if self._buf_c.size else 0.0,

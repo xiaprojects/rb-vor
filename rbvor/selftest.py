@@ -221,9 +221,20 @@ def run_self_test(config_path: Path | None = None) -> int:
                                   freq_khz=109_500, usable=True)).payload
     shape_ok = shape_ok and (set(p23) == set(payload) | set(LOC_KEYS)
                              and p23["locdev"] == 50 and p23["vorstatus"] == 0)
+    # v2.4 adds the gs* keys only with gs.enabled (A44)
+    from rbvor.publisher import GS_KEYS, GsWire
+    pol3 = PublishPolicy({"keepalive_s": 0, "hold_s": 3.0, "bearing_ref": "from"})
+    p24 = pol3.decide(None, state="TRACKING", status=0,
+                      loc=LocWire(status=5, ddm=0.0775, sdm=0.40, snr_db=40.0,
+                                  freq_khz=109_500, usable=True),
+                      gs=GsWire(status=5, ddm=0.0875, sdm=0.80, snr_db=40.0,
+                                freq_khz=332_600, usable=True)).payload
+    shape_ok = shape_ok and (set(p24) == set(p23) | set(GS_KEYS)
+                             and p24["gsdev"] == 50 and p24["gsshared"] == 0)
     r.add(f"publish payload conforms to {IF_VERSION}",
           PASS if shape_ok else FAIL,
-          f"{payload}; with loc.enabled +{len(LOC_KEYS)} loc* keys")
+          f"{payload}; with loc.enabled +{len(LOC_KEYS)} loc* keys, "
+          f"with gs.enabled +{len(GS_KEYS)} gs* keys")
 
     # 6b -- localizer chain (A33), run whether or not it is enabled: it proves
     # the software, like every other stage here.
@@ -246,6 +257,37 @@ def run_self_test(config_path: Path | None = None) -> int:
     r.add("localizer invalid on noise only (plan 4.1)",
           PASS if lnoise and all(v.flagged for v in lnoise) else FAIL,
           f"{sum(v.flagged for v in lnoise)}/{len(lnoise)} windows flagged")
+
+    # 6c -- glide-slope chain (A39-A44), likewise run whether enabled or not:
+    # a glide path at the 0.005 % carrier limit (16.75 kHz at 335 MHz), which
+    # the localizer front end alone cannot hear (A41), and noise only.
+    from rbvor.gs import GsDemod, GsDspParams, GsQualityParams
+    from tools.gs_gen import GsParams
+    gp = GsParams(ddm=0.0875, drift_hz=16_750.0, fs=FS, offset_hz=-FS // 4,
+                  seconds=6.0, snr_db=25.0, block=1 << 16)
+    gd = GsDemod(GsDspParams(fs=FS, offset_hz=-FS // 4, acquire_hz=30_000.0))
+    gobs = [x for b in loc_blocks(gp) for x in gd.push(b)][3:]
+    gq = LocQuality(GsQualityParams())
+    gres = [gq.update(x, x.ddm_corrected) for x in gobs]
+    gerr = max((abs(x.ddm_corrected - 0.0875) for x in gobs), default=1.0)
+    r.add("glide-slope DDM (half sector, carrier +16.75 kHz)",
+          PASS if gobs and gerr < 0.01 and not gres[-1].flagged else FAIL,
+          f"max error {gerr:.4f} DDM over {len(gobs)} windows, carrier found "
+          f"{gd.acquired_hz / 1000:+.2f} kHz")
+    gd2 = GsDemod(GsDspParams(fs=FS, offset_hz=-FS // 4, acquire_hz=30_000.0))
+    gq2 = LocQuality(GsQualityParams())
+    gnoise = [gq2.update(x, x.ddm_corrected) for x in gd2.push(noise)]
+    r.add("glide slope invalid on noise only (plan 4.1)",
+          PASS if gnoise and all(v.flagged for v in gnoise) else FAIL,
+          f"{sum(v.flagged for v in gnoise)}/{len(gnoise)} windows flagged")
+    if cfg is not None and cfg.sdr.get("devices"):
+        from rbvor.sdr import allocate, format_allocation, rtl_serials
+        try:
+            serials = rtl_serials()
+            lines = format_allocation(allocate(cfg.sdr, serials), serials)
+            r.add("dongle allocation (sdr.devices)", PASS, "; ".join(lines[1:4]))
+        except Exception as e:                       # noqa: BLE001
+            r.add("dongle allocation (sdr.devices)", FAIL, str(e))
 
     # 7 -- performance
     pct = 100.0 * dsp_s / signal_s * (FS / 1_024_000)

@@ -164,6 +164,96 @@
           "minimum": 0,
           "maximum": 60
         },
+        "auto_gain": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "A47: automatic tuner gain within [min_db, max_db]. Evaluated once per eval_s: a severely clipping ADC is stepped down in any decoding state; otherwise, while not tracking, the gain is moved to maximise the carrier against the floor (probing one step and keeping it only if that ratio improves), and with no carrier in view the ADC level is kept between rms_low_counts and rms_high_counts. Absent or enabled false: fixed gain_db, exactly as before. Ignored with gain_mode \"agc\".",
+          "required": [
+            "enabled",
+            "min_db",
+            "max_db"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "min_db": {
+              "type": "number",
+              "minimum": -10,
+              "maximum": 60,
+              "description": "lowest gain allowed; snapped inward to the tuner's ladder"
+            },
+            "max_db": {
+              "type": "number",
+              "minimum": -10,
+              "maximum": 60,
+              "description": "highest gain allowed"
+            },
+            "clip_max_pct": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 100,
+              "description": "percent of samples clipped above which, while not tracking, the gain steps down (default 1)"
+            },
+            "clip_severe_pct": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 100,
+              "description": "percent clipped above which the gain steps down two steps even while tracking (default 5)"
+            },
+            "rms_low_counts": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 127,
+              "description": "ADC RMS (8-bit counts) below which, with no carrier in view, the gain steps up (default 4)"
+            },
+            "rms_high_counts": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 127,
+              "description": "ADC RMS above which, with no carrier in view, the gain steps down (default 20: under FM overload the carrier emerges before the level falls this far)"
+            },
+            "eval_s": {
+              "type": "number",
+              "minimum": 0.25,
+              "maximum": 10,
+              "description": "seconds of samples per decision (default 1)"
+            },
+            "probe_s": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 3600,
+              "description": "minimum seconds between probes once a probe did not help (default 30)"
+            },
+            "improve_db": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 20,
+              "description": "carrier/floor improvement a probe must show to be kept (default 1)"
+            },
+            "carrier_min_db": {
+              "type": "number",
+              "minimum": 3,
+              "maximum": 40,
+              "description": "peak over floor, in a fs/16384 bin, that counts as a carrier in view (default 6)"
+            },
+            "search_hz": {
+              "type": "number",
+              "minimum": 500,
+              "maximum": 19000,
+              "description": "+/- Hz around the expected carrier to look for it (default 10000)"
+            },
+            "settle_s": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 10,
+              "description": "seconds after a step during which windows are dropped, on top of one integration window (default 1.5)"
+            },
+            "_note": {
+              "type": "string"
+            }
+          }
+        },
         "ppm": {
           "type": "integer",
           "minimum": -200,
@@ -242,10 +332,168 @@
                 "minimum": -200,
                 "maximum": 200
               },
+              "auto_gain": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "A47: automatic gain for THIS tuner (its ladder differs: FC0012 tops out at 19.2 dB, R820T at 49.6). Replaces the sdr block's auto_gain as a whole.",
+                "required": [
+                  "enabled",
+                  "min_db",
+                  "max_db"
+                ],
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "min_db": {
+                    "type": "number",
+                    "minimum": -10,
+                    "maximum": 60,
+                    "description": "lowest gain allowed; snapped inward to the tuner's ladder"
+                  },
+                  "max_db": {
+                    "type": "number",
+                    "minimum": -10,
+                    "maximum": 60,
+                    "description": "highest gain allowed"
+                  },
+                  "clip_max_pct": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "maximum": 100,
+                    "description": "percent of samples clipped above which, while not tracking, the gain steps down (default 1)"
+                  },
+                  "clip_severe_pct": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "maximum": 100,
+                    "description": "percent clipped above which the gain steps down two steps even while tracking (default 5)"
+                  },
+                  "rms_low_counts": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 127,
+                    "description": "ADC RMS (8-bit counts) below which, with no carrier in view, the gain steps up (default 4)"
+                  },
+                  "rms_high_counts": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 127,
+                    "description": "ADC RMS above which, with no carrier in view, the gain steps down (default 20: under FM overload the carrier emerges before the level falls this far)"
+                  },
+                  "eval_s": {
+                    "type": "number",
+                    "minimum": 0.25,
+                    "maximum": 10,
+                    "description": "seconds of samples per decision (default 1)"
+                  },
+                  "probe_s": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 3600,
+                    "description": "minimum seconds between probes once a probe did not help (default 30)"
+                  },
+                  "improve_db": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 20,
+                    "description": "carrier/floor improvement a probe must show to be kept (default 1)"
+                  },
+                  "carrier_min_db": {
+                    "type": "number",
+                    "minimum": 3,
+                    "maximum": 40,
+                    "description": "peak over floor, in a fs/16384 bin, that counts as a carrier in view (default 6)"
+                  },
+                  "search_hz": {
+                    "type": "number",
+                    "minimum": 500,
+                    "maximum": 19000,
+                    "description": "+/- Hz around the expected carrier to look for it (default 10000)"
+                  },
+                  "settle_s": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 10,
+                    "description": "seconds after a step during which windows are dropped, on top of one integration window (default 1.5)"
+                  },
+                  "_note": {
+                    "type": "string"
+                  }
+                }
+              },
               "_note": {
                 "type": "string"
               }
             }
+          }
+        },
+        "devices": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "description": "A40 (docs/gs-plan.md 6.1): the dongles this receiver may use, in order of preference. Absent: one dongle from device_serial / device_index, exactly as A27. Present: nav (VOR and localizer) takes the first present entry allowing it, the glide slope the first other one; with none, the glide slope shares the nav dongle and the pilot selects LOC or GS (gsselect). An absent entry is a warning, not an error; a dongle not listed is never opened (it belongs to Stratux or rb-sdr-radio).",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "device_serial": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "preferred: set once with `rtl_eeprom -d <n> -s <name>`"
+              },
+              "device_index": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 31,
+                "description": "allowed, but USB enumeration order is not stable (A27)"
+              },
+              "use": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "enum": [
+                    "nav",
+                    "gs"
+                  ]
+                },
+                "description": "what this dongle's antenna and filters can serve; default both"
+              },
+              "gain_db": {
+                "type": "number",
+                "minimum": -10,
+                "maximum": 60,
+                "description": "overrides tuner_profiles and the sdr block for this dongle"
+              },
+              "ppm": {
+                "type": "integer",
+                "minimum": -200,
+                "maximum": 200
+              },
+              "swap_iq": {
+                "type": "boolean"
+              },
+              "bias_tee": {
+                "type": "boolean"
+              },
+              "_note": {
+                "type": "string"
+              }
+            },
+            "anyOf": [
+              {
+                "required": [
+                  "device_serial"
+                ]
+              },
+              {
+                "required": [
+                  "device_index"
+                ]
+              }
+            ]
           }
         }
       },
@@ -762,6 +1010,145 @@
         },
         "_note": {
           "type": "string"
+        }
+      }
+    },
+    "gs": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A39-A45 (docs/gs-plan.md): ILS glide slope, decoded on the glide-path channel paired with the selected localizer. Optional; requires loc.enabled. Defaults in rbvor/config.py GS_DEFAULTS.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Ships false until a real glide slope has been decoded (plan G8). With it false the payload is RB-VOR-IF v2.3 byte for byte."
+        },
+        "integration_s": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 5,
+          "description": "window, whole 1/30 s; chosen from the noise-against-lag sweep (docs/gs-sweep.md)"
+        },
+        "hop_s": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 5,
+          "description": "whole 1/30 s, <= integration_s"
+        },
+        "tone_search": {
+          "type": "number",
+          "minimum": 0.001,
+          "maximum": 0.05,
+          "description": "+/- fractional tone-frequency search; Cat I allows 0.025 (A34)"
+        },
+        "smooth_n": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "description": "moving average of the published DDM; the raw value is judged (A15)"
+        },
+        "solution_csv": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "per-solution glide-slope log; default gs.csv beside log.solution_csv (own schema, A33's reason)"
+        },
+        "quality": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "A43: from the glide-slope sweep, not copied from the localizer",
+          "properties": {
+            "weights": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "sdm": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "snr": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "stab": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              },
+              "required": [
+                "sdm",
+                "snr",
+                "stab"
+              ]
+            },
+            "snr_lo_db": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 80
+            },
+            "snr_hi_db": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "stab_full_ddm": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 0.8
+            },
+            "flag_snr_db": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 80
+            },
+            "flag_sdm": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "flag_stab_threshold": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "flag_eps_std": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 0.05
+            },
+            "history": {
+              "type": "integer",
+              "minimum": 3,
+              "maximum": 50
+            },
+            "_note": {
+              "type": "string"
+            }
+          }
+        },
+        "_note": {
+          "type": "string"
+        },
+        "acquire_hz": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100000,
+          "description": "A41: +/- span of the coarse carrier search before the channel filter, Hz; 0 = off. Annex 10 allows 0.005 % = 16.75 kHz at 335 MHz"
+        },
+        "acquire_min_db": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 80,
+          "description": "A41: carrier peak against the median of the searched span; noise alone reads ~11 dB"
+        },
+        "retry_s": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 60,
+          "description": "seconds between attempts on a glide-slope dongle that cannot be had; default sdr.retry_s"
         }
       }
     }

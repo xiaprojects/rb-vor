@@ -1,8 +1,35 @@
 # Full ILS for RB-VOR on RB-01: glide slope and multiple SDRs, implementation plan
 
 Brief for the implementing session (Claude Opus). Written 2026-11-11 against
-`main` at `006c2f6` **plus the uncommitted localizer work** (A33–A38, D9,
-`docs/loc-plan.md` phase A and B). Read `CLAUDE.md` first: it is the working
+`main` at `006c2f6` plus the then-uncommitted localizer work; **revised
+2026-11-13 against `2cb8d0f`**, where that work (A33–A38, D9,
+`docs/loc-plan.md` phase A and B) is committed. The revision re-checked
+every fact in section 2 against both trees, checked the pairing table's
+structure (4.4), and added the FC0012 band switch (section 2, 6.2, 9).
+> **Status 2026-11-13: phase A (G0–G7) implemented in the working tree, not
+> committed.** Recorded as CLAUDE.md A39–A45 and D10, open items O31–O40,
+> questions Q9–Q15; next free numbers **A46, D11, O41, Q16**. G8 (a real
+> signal) and phase B (H1–H4, roastbeef) not started. Where the work departs
+> from this plan, the plan is left as written and the departure is here:
+>
+> - `gsselect` is **edge-triggered** (6.2 says only "debounced"): without it a
+>   bridge re-asserting `gsselect: 1` undoes the reset to LOC on a new
+>   station. The bridge client applies `vorfreq` before `gsselect` from one
+>   frame, so the read on connect still restores the pilot's choice (A44).
+> - The coarse acquisition of 4.2 (A41) leaves offsets below the AFC
+>   threshold to the AFC, and searches again every second while nothing has
+>   been found — both found by measuring the first version.
+> - A dedicated GS dongle that disappears turns the receiver shared at the
+>   next glide-slope retry (6.1 covered only the reverse).
+> - Not in the plan: a glide slope with no samples for 3 s drops to
+>   NO_SIGNAL (A45), because the A30 gap would otherwise leave a usable
+>   marker on the bridge. The nav side keeps the gap (O35).
+> - The pairing table was checked against two secondary copies, not Annex 10
+>   (O31); `gs.enabled` ships false regardless.
+> - `../roastbeef/test/integration/test_vor_radio.py` was not run: the plate
+>   does not read `gs*` until H1.
+
+Read `CLAUDE.md` first: it is the working
 log, and its conventions (numbered amendments, struck-through corrections,
 "measured, not assumed") apply here. Read `docs/loc-plan.md` and
 `docs/RB-VOR-IF-v2.3.md` second: this plan builds on both and does not repeat
@@ -23,6 +50,21 @@ The work has two phases in two repositories, as for the localizer:
   frozen the wire format (RB-VOR-IF v2.4).
 
 G8 (a real signal) closes both.
+
+**One SDR or several, at a glance.** Both are the same code: the
+allocation of 6.1 decides at every tune which case applies, so a second
+dongle plugged in turns a shared receiver into a dedicated pair without a
+config edit.
+
+| | one shared SDR | dedicated SDRs (two or more listed) |
+|---|---|---|
+| what is received | LOC **or** GS, never both (220 MHz apart, section 2) | LOC and GS together |
+| who chooses | the pilot, `gsselect` on the plate (6.2) | nobody; `gsselect` is ignored |
+| the needle not received | dark: status 0, deviation 0 (4.5) | both live |
+| wire | `gsshared` 1 | `gsshared` 0 |
+| a dongle busy or absent | the whole ILS is NO_SDR (A30) | per receiver: LOC carries on, GS is NO_SDR |
+| new risks | stale needle after a switch (4.5); the FC0012 band switch on every LOC↔GS change (section 2) | Stratux taking an untagged dongle (H3); USB throughput and CPU of two chains on the Pi (6.3) |
+| rejected | automatic LOC/GS alternation (6.2) | falling back to sharing when the GS dongle is busy (6.1, Q10) |
 
 ## 1. Goal
 
@@ -77,7 +119,8 @@ consequences.
 | `rb-sdr-radio` picks its dongle the same way (`device_serial` / `device_index`) and yields per A30. | Any listed dongle may be found busy at any retune. `NO_SDR` becomes per receiver. |
 | `test/integration/dongle.py` in roastbeef stands in for **one** USB device and imports `VorParams` / `LocParams` and `generate_blocks` from this repo's tools. | Those APIs stay as they are. A two-receiver test needs a second stand-in device (H4). |
 | The aircraft has an FC0012 on the VOR antenna (covers 22–948 MHz, so it reaches 330) and an R820T2 on 1090 (A28). Neither has decoded a navaid in flight (F6, O21, O22). | Hardware reaches the band. Whether the antenna and the FM band-stop filter pass 330 MHz is unknown (O6, section 9). Everything here is proven on synthetic signals and the bench R820T first. |
-| `config/rb-vor.json` in the working tree has `loc.enabled: true`, while `tests/test_loc_controller.py::test_shipped_config_has_the_localizer_disabled` pins `false`. | Probably Stefano's bench edit. G0 reports it; do not revert it and do not edit the test. Ask (Q9). |
+| librtlsdr drives the FC0012's V-band / U-band front-end filter from a GPIO, switching at **300 MHz** (from memory of `librtlsdr.c`, `fc0012_set_freq`; **to verify** in the source the Pi actually runs). LOC (108–112) is on one side, GS (329–335) on the other. O22 already notes that not every board wires that GPIO. | Hypothesis, not a measurement: on a board that does not wire it, the FC0012 receives 330 MHz through the wrong filter, and a shared FC0012 changes front end on every LOC↔GS switch. Section 9 step 1 measures it; the R820T has no such switch. |
+| ~~`config/rb-vor.json` in the working tree has `loc.enabled: true`, while `tests/test_loc_controller.py::test_shipped_config_has_the_localizer_disabled` pins `false`.~~ **At `2cb8d0f` the `true` is committed**, so HEAD fails that test. The working tree changes it back to `false` (uncommitted, 2026-11-13). | G0 runs the suite on the working tree *and* notes that HEAD alone fails. Do not touch either; Q9. |
 
 ## 3. Sources
 
@@ -173,6 +216,13 @@ written from memory. Before any code depends on them:
   from 329.15 to 335.00 MHz;
 - if the document cannot be reached, the table ships marked unverified, an
   open item says so, and `gs.enabled` cannot be true in the shipped config.
+
+Checked 2026-11-13, against the table in section 5: 40 distinct GS channels,
+all on the 150 kHz grid, 329.15 to 335.00, and the LOC column equal to
+`freqrules.loc_channels()`. Grid and count give 40 slots for 40 values, so
+the table is a one-to-one map onto the band. **That is all the check
+shows.** Two rows with their GS values swapped pass it, which is exactly the
+wrong-runway error. Only the document settles the rows.
 
 ### 4.5 One dongle, two needles: the unselected one must go dark
 
@@ -347,6 +397,14 @@ hardware.
 Automatic alternation (LOC for N seconds, GS for N seconds) is rejected for
 this version: each needle would be stale half the time, each retune costs
 `settle_ms` plus an acquisition, and 4.5 would have to hold on every hop.
+In numbers, from the localizer's own settings (D9, A35, A37): settle, drop
+the filter fill, prime 1/30 s, then one 1 s window, and at least two
+windows before quality stops warming. That is roughly 1.5–2 s blind after
+every hop before a needle can be valid, on a 1 s window. On an FC0012 each
+hop also throws the band switch of section 2. Measure the real switch time
+in G6 (switch command to first status ≥ 4, synthetic, both directions)
+and record it, because the plate's help text should say how long the
+switch takes.
 If it is ever wanted it is a separate plan with its own measurement.
 
 ### 6.3 Receiver structure
@@ -472,10 +530,12 @@ Each ends with the full suite green (`python -m pytest`, deps from
 `ruff check .` clean. Nothing is committed or deployed by the implementing
 session: Stefano reviews the working tree.
 
-**G0. Baseline.** `git status` and `git log` first (D8). The tree holds the
-uncommitted localizer work and Stefano's addon-layout changes: build on them,
-do not revert or reformat. Run the suite and note the count and any failure
-(see the `loc.enabled` row of section 2). Take fingerprints before any edit,
+**G0. Baseline.** `git status` and `git log` first (D8). The localizer is
+committed (`2cb8d0f`). At revision time the tree also held uncommitted
+changes: `config/rb-vor.json` (`loc.enabled` back to false),
+`rbvor.version` moved to `ota/`, and a new `ota/create_ota_package.sh`.
+Build on whatever is there, do not revert or reformat. Run the suite and
+note the count and any failure (see the `loc.enabled` row of section 2). Take fingerprints before any edit,
 A33's method: a SHA-256 over every field of every observation for (a) the
 real capture `captures/capture_20260413T195020Z_109400.cu8` under the VOR
 settings A33 used, (b) a synthetic VOR run, (c) a synthetic localizer run
@@ -598,7 +658,10 @@ O22) and on the localizer's own L7 (O23). In order of cost:
    installations commonly feed the glide-slope receiver from the VOR/LOC
    antenna through a diplexer, which suggests it can work; this is a
    hypothesis here, not a measurement), the FM band-stop filter's passband
-   (A27), and any airband filter or LNA (O8), which would block it.
+   (A27), any airband filter or LNA (O8), which would block it, and for
+   the FC0012 the U-band GPIO of section 2: compare the floor and a signal
+   generator or known carrier just below and just above 300 MHz. A step at
+   300 MHz in the wrong direction means the board does not wire the switch.
 2. **Ground, near an ILS runway, bench R820T.** On the ground one is far
    below the path, so the expected reading is strongly fly-up (150 Hz
    predominant) or nothing at all outside the azimuth coverage. Fly-up is a
@@ -634,7 +697,7 @@ Work proceeds on the interim default; none of these blocks phase A.
 
 | Q | question | interim default |
 |---|---|---|
-| Q9 | `config/rb-vor.json` has `loc.enabled: true` in the working tree against the test that pins false. Deliberate? | left as found, reported in G0 |
+| Q9 | `2cb8d0f` commits `loc.enabled: true` while a test pins false, so HEAD fails it; the working tree reverts to false, uncommitted. Commit the revert? | left as found, reported in G0 |
 | Q10 | With two dongles listed and the GS one busy (radio), should the glide slope fall back to sharing the NAV dongle? | no: GS shows NO SDR, LOC continues |
 | Q11 | How are NAV / GS / radio dongles kept away from Stratux's automatic assignment: a reserved serial prefix skipped by `configDevices()`? Which prefix? | plain serials in `sdr.devices`; H3 waits |
 | Q12 | "Settings" is read here as `rb-vor.json` (`sdr.devices`). Should the RB-01 settings page edit it too? | file only |

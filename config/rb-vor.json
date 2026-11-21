@@ -23,17 +23,23 @@
     "tuner_offset_hz": -256000,
     "gain_mode": "manual",
     "gain_db": 19.2,
+    "auto_gain": {
+      "enabled": false,
+      "min_db": 0.0,
+      "max_db": 49.6,
+      "_note": "A47: automatic gain within [min_db, max_db]; gain_db is the starting point. Off until flown: set enabled true to try it. Steps down on ADC clipping (two steps even while tracking above clip_severe_pct, default 5 %); while not tracking, probes one step at a time and keeps a step only if the carrier rises against the floor -- under broadcast-FM overload that means LESS gain (CLAUDE.md F7 analysis). Every step is in the journal as 'automatic gain: ...'; the gain in force is in the status line and in each capture sidecar."
+    },
     "ppm": 9,
     "bias_tee": false,
     "swap_iq": false,
     "tuner_profiles": {
       "FC0012": {
         "gain_db": 19.2,
-        "_note": "VOR antenna in this aircraft. Five gain steps, max 19.2 dB. Zero-IF: if `vor_replay.py --auto-swap` on a capture from THIS dongle says the swapped sense wins, add \"swap_iq\": true HERE -- not globally, the bench R820T does not want it (CLAUDE.md A28, open item O21)."
+        "_note": "VOR antenna in this aircraft (index 0; the R820T2 at index 1 serves 1090 MHz, which the FC0012 cannot reach: max 948.6 MHz). Differences from the R820T: (1) GAIN: only five steps, -9.9 / -4.0 / 7.1 / 17.9 / 19.2 dB; any other value is snapped to the nearest step and logged, so 19.2 is the top of its range (32.8 would clamp to 19.2, the 14.4 flown in F6 really ran at 17.9). Starting point, not measured: O19 wants a gain sweep judged on carrier-to-floor in `vor_replay.py --survey`. (2) SPECTRAL SENSE: zero-IF, no spectrum inversion in librtlsdr, whereas the R820T is low-IF with inversion; swap_iq false (D5) was measured on the R820T only. Hypothesis for F6, not a measurement, so swap_iq is deliberately ABSENT here (a test pins that): if `vor_replay.py --auto-swap` on a capture from THIS dongle says the swapped sense wins, add \"swap_iq\": true HERE, never globally (A28, O21). (3) PPM: none set, falls back to the sdr block (9, measured on another dongle); measure it for this one. (4) SENSITIVITY: far worse VHF noise figure than the R820T2; replacing it with an R820T2 removes all of the above (A28)."
       },
       "R820T": {
         "gain_db": 32.8,
-        "_note": "bench/car dongle; every convention in CLAUDE.md was measured on it"
+        "_note": "Bench/car dongle; every convention in CLAUDE.md (D5 swap_iq false, A25 filters, calibration) was measured on it. Gain is a ~29-step ladder up to 49.6 dB; 32.8 is a real step. Low-IF with spectrum inversion done by librtlsdr, so the sdr-block swap_iq false is right for it. ppm from the sdr block."
       }
     },
     "settle_ms": 250,
@@ -108,7 +114,11 @@
     "solution_csv": "/var/log/rb-vor/vor.csv"
   },
   "loc": {
-    "enabled": true,
+    "enabled": false,
     "_note": "ILS localizer (CLAUDE.md A33-A37, D9; RB-VOR-IF v2.3). Off until a real localizer has been decoded (docs/loc-plan.md L7). Every other loc key is optional with defaults in rbvor/config.py LOC_DEFAULTS."
+  },
+  "gs": {
+    "enabled": false,
+    "_note": "ILS glide slope (CLAUDE.md A39-A45; RB-VOR-IF v2.4; docs/gs-plan.md). Requires loc.enabled. Off until a real glide slope has been decoded (plan G8). Supplemental, not approach guidance. Every other gs key is optional with defaults in rbvor/config.py GS_DEFAULTS. Two dongles: list them in sdr.devices."
   }
 }

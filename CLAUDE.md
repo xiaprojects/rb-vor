@@ -963,6 +963,304 @@ sits, flipped `locstatus` **23 times in ~64 s** — ±5 points of hysteresis on
 the split in LOC mode. At 10 dB 81/min remain: the 1 s DDM really moves by
 3 % FS there; more would need smoothing, which costs lag.
 
+### A39 — glide slope, phase A: pairing, generator, demodulator (2026-11-13)
+Brief: `docs/gs-plan.md` (G0–G8, revised the same day). Glide-slope decoding
+is in, **shipped disabled** (`gs.enabled: false`, pinned by
+`tests/test_gs_controller.py::test_shipped_config_has_the_glide_slope_disabled`);
+`gs.enabled` requires `loc.enabled` (config error naming both keys).
+
+**G0 baseline.** `main` at `2cb8d0f` plus an uncommitted tree
+(`config/rb-vor.json` with `loc.enabled` back to false, `rbvor.version` moved
+to `ota/`, `ota/create_ota_package.sh`). **HEAD alone fails
+`test_shipped_config_has_the_localizer_disabled`**: `2cb8d0f` commits
+`loc.enabled: true` (read, not run; Q9). Working tree: 942 collected, 942
+passed, ruff clean. Fingerprints, A33's method plus the controller: SHA-256
+over every observation field for the real capture under four DSP settings,
+a synthetic VOR and a synthetic localizer, and over every published payload
+through the controller for VOR (loc off / on) and LOC — nine in all, taken
+before any edit and **identical at the end** (script in the session
+scratchpad; the method is what matters, the hashes are not portable across
+numpy builds).
+
+**Pairing.** `freqrules.GS_PAIRING_KHZ`, `gs_channel_khz()`, `gs_channels()`.
+Written from memory, then agreed row by row with two secondary copies
+(RadioReference wiki with TACAN channels; the FAA AIM table as a search result
+quoted it). **Not checked against Annex 10 Vol I 3.1.6.1 itself** (O31). The
+test holds the table a second time as text in another layout, and RB-VOR-IF
+v2.4 a third time, checked by `tests/test_gs_docs.py`. Structure: 40 distinct
+glide paths on the 150 kHz grid 329.15–335.00 and LOC column ==
+`loc_channels()` — which, as plan 4.4 now says, does **not** catch two swapped
+rows. `classify()` and friends unchanged.
+
+**Generator.** `tools/gs_gen.py` is `loc_gen` with glide-path defaults
+(`GsParams(LocParams)`: SDM 0.80, no ident), same `generate_blocks`. One
+change to `loc_gen`: the two-carrier separation limit 30 → 40 kHz (glide
+paths use up to 32 kHz); output unchanged (fingerprint). Independent reference
+decoder in `tests/test_gs_gen.py`; the cases that must fail: swapped tones
+negate, a localizer-depth signal reads SDM 0.40.
+
+**Demodulator.** `rbvor/gs.py`: `GsDemod(LocDemod)`, `GsObservation`
+(the derived DDMs at SDM 0.80), `GsDspParams(LocDspParams)`,
+`GsQualityParams(LocQualityParams)`. The one change to `loc.py`:
+`LocDemod.obs_cls`, the record `_emit` builds. With the search off `GsDemod`
+is `LocDemod` field for field (tested). Measured (`docs/gs-sweep.md`):
+DDM within 1e-3 over ±0.25 noiseless; SDM 0.75 / 0.85 with the 150 Hz phase
+swept read as transmitted (envelope within 15 % of zero is not a problem);
+A34's search holds at 40 % depth across ±3 % (a near-fixed bin reads −430 %
+of full scale at 3 %).
+
+### A40 — more than one SDR: the list, the allocation, the readers (2026-11-13)
+Optional `sdr.devices`, an ordered list of `{device_serial | device_index,
+use: [nav, gs], gain_db, ppm, swap_iq, bias_tee}`. Absent: A27 exactly, one
+dongle for everything, the glide slope shares it. The policy is one pure
+function, `sdr.allocate(cfg_sdr, serials) -> Allocation(nav, gs, shared,
+notes)`, tested as a table (0–3 dongles, `use`, absent / duplicate / unlisted
+serials, index entries) in `tests/test_gs_allocation.py`.
+
+**Relaxes A27, list form only:** a listed dongle that is absent is a note
+naming every serial present, not an error; allocation goes on with the rest;
+none at all is NO_SDR. A27's guarantee holds — nothing is opened that the
+list does not name. Two entries on one dongle, or two dongles sharing a
+listed serial, is still an error. Precedence of overrides: entry, then
+`tuner_profiles`, then the block — carried as `_device_overrides` so
+`apply_tuner_profile` (which runs once the tuner is known) lets the entry win;
+without entries it behaves as before (tested).
+
+`SdrReader.bind(cfg | None, reason)` re-points a reader (None: the next open
+raises `SdrError(reason)`, i.e. NO_SDR); `before_open` re-reads the
+allocation at every open from a released dongle, and the controller asks
+`allocate()` at every ILS tune attempt. So a dongle plugged in later is used
+at the next retune or switch, and one that goes away turns the receiver
+shared at the next glide-slope retry. Enumeration happens on those events
+only, never per block. `python3 -m rbvor --devices` prints serials and the
+allocation without opening anything (opening could take a dongle from
+Stratux); the tuner type is logged at open, as before.
+
+Busy is per receiver and **does not fall back to sharing** (plan 6.1; Q10).
+
+### A41 — the glide path's carrier tolerance is wider than the channel filter (2026-11-13, G4)
+Predicted in plan 4.2, then measured before any fix. Annex 10 allows 0.005 %:
+16.75 kHz at 335 MHz. With the localizer front end alone (13 kHz channel
+filter, AFC after it) the glide path is **received to 12 kHz and lost from
+14 kHz** at fs 256 kHz (from 16.75 kHz at 1.024 Msps): SDM 0.019, tone SNR
+2.5 dB — flagged as no signal, never a needle, but a lawful station at the
+limit would never be heard. A9 again.
+
+Fix: a coarse carrier search in `GsDemod` **before** the channel filter —
+Hann FFT of the first 64 ms after every reset, peak within `acquire_hz` of
+where the carrier belongs, parabola, accepted at ≥ 20 dB over the median of
+the span (noise reads ≤ 11.5 dB over 1120 windows), and the down-mix
+correction set from it; the AFC tracks from there. Shipped `acquire_hz`
+30 kHz = the legal limit plus 27 ppm at 330 MHz (`GS_DEFAULTS`; the
+`GsDspParams` default stays 0 = off, pure `LocDemod`). Result: every offset
+to ±28 kHz decodes at 20 and 6 dB as at nominal.
+
+Two corrections to the first version, both found by measuring it:
+- it set a correction for any offset, so even a carrier on nominal paid a
+  complex multiply per sample (1.81 vs 1.04 % of a core). Now a found offset
+  below the AFC's own threshold (300 Hz) is left to the AFC and the chain
+  stays `LocDemod` sample for sample (tested). Idle desktop: 1.0 % on
+  nominal, 1.66 % with the correction active;
+- it searched once per reset, so a glide path coming into coverage after the
+  retune, far off nominal, would never be found. While nothing has been found
+  it now searches a copy of the stream every `acquire_retry_s` (1 s) without
+  holding samples back (tested: noise 3 s, then a carrier at +20 kHz, found).
+
+Two-frequency glide paths (synthetic, separation 4–32 kHz from memory, O31):
+with the clearance carrier 6–10 dB down the search locks the course carrier
+at every separation; AFC-only at 32 kHz reads the wrong sign (−0.033 for
++0.0875) but 0 % of those windows pass validity. At **equal** power the
+search may lock the clearance carrier and read its DDM, valid and steady —
+O36.
+
+### A42 — the glide slope's DDM form: D9 at SDM 0.80 (2026-11-13)
+D9's three-way comparison, repeated (`docs/gs-sweep.md`, "Accuracy"). Raw
+m150 − m90 under-reads by the envelope compression: scale 0.844 at 10 dB,
+0.470 at 3 dB channel SNR — the unsafe direction, as for the localizer.
+Normalised and one-sided read the same at every SNR measured (the SDM never
+reads above 0.80 there): RMS 1.1 / 4.3 / 6.7 / 9.8 % of full scale at 20 /
+10 / 6 / 3 dB. At lawful SDMs ≠ 0.80, noiseless, full scale: 0.75 →
++6.7 % (both), 0.85 → −5.8 % normalised, +0.1 % one-sided. **Published:
+DDM × max(1, 0.80 / SDM)** (`gs.gs_ddm_corrected`), the same rule at the glide
+path's nominal; errs, when it errs, towards more deviation.
+
+### A43 — glide-slope validity and window, from the sweep (2026-11-13, G5)
+Noise only, cu8-quantised, 5 levels × 4 seeds × 30 s, acquisition on: 1120
+windows, tone SNR ≤ 10.6 dB, SDM ≤ 0.035, **0 windows pass**. The state-machine
+tests (four noise runs on two receivers, one on a shared receiver) never reach
+`gsstatus` ≥ 4.
+
+`GsQualityParams`: A37's localizer figures at the glide path's scale —
+`flag_snr_db` 26, `flag_sdm` 0.40 (half the nominal, as the localizer's 0.20),
+`stab_full_ddm` 0.035 (20 % of 0.175), `flag_eps_std` 0.5 %, weights 0.10 /
+0.70 / 0.20, SNR mapped 26–46 dB. **The SDM flag is the one that binds**: it
+cuts at about 3.5 dB channel SNR, where the worst window that passes every
+flag is 23.5 % of full scale out — A37's "about one dot" criterion. Measured
+("Error of the windows that pass every flag"): raising `flag_snr_db` to 28 or
+30 dB leaves the worst window at 23.5 % and only cuts availability at 4 dB
+from 81 % to 60 / 31 %. So the SNR flag stays at 26. At 6 dB channel SNR 77 %
+of the valid windows are TRACKING-grade. Judgement on synthetic noise, as A37
+(O27 applies to the glide slope too).
+
+Window: 1 s / 0.5 s hop, as the localizer. DDM std 3.1 / 5.2 % of full scale
+at 10 / 6 dB, against 4.4 / 7.6 % for 0.5 s (lag 0.25 s) and 2.3 / 3.8 % for
+2 s (lag 1 s). The plan asked whether a marker close in, which moves faster,
+wants a shorter window; at 0.5 s the noise is 1.4× and the flag rate rises,
+and 0.25 s of lag was judged worth less than that. Judgement, recorded as
+such.
+
+### A44 — the glide slope in the controller and on the wire: RB-VOR-IF v2.4 (2026-11-13, G6)
+**`GsReceiver`** (`controller.py`): the glide slope's own state machine —
+TUNING / NO_SDR / ACQUIRING / TRACKING / DEGRADED / NO_SIGNAL / IDLE, settle,
+retry, hold, A38's split hysteresis — mirroring `_handle_loc` window by
+window, on a port given at start: the GS dongle (dedicated) or the nav dongle
+(shared). Validity never borrowed from the localizer; each axis fails alone
+(tested both ways, and a nav dongle that will not open does not stop the
+glide slope). The VOR / LOC paths of `Controller` are untouched except where
+the glide slope must be stopped or started (retune, idle, invalid, bridge loss,
+shutdown); fingerprints identical.
+
+**One receiver: the pilot's switch.** Consumed key `gsselect` (0 LOC, 1 GS),
+acted on only for a shared receiver on an ILS. Mode `"gs"` lends the nav
+dongle to the `GsReceiver`, and the controller's own state mirrors it. Rules,
+each with a test that fails without it (mutation-checked):
+- the needle not received goes dark **in the same POST** that announces the
+  other tuning (plan 4.5), both directions; the dongle is handed over, never
+  released between;
+- **edge-triggered**: only a value different from the last received counts.
+  Without it a bridge re-asserting `gsselect: 1` undid the reset below;
+- a new `vorfreq` resets to LOC; the bridge client applies `vorfreq` before
+  `gsselect` from one frame, so the read on connect (A31) restores the pilot's
+  choice after a restart (tested), while re-assertions after a station change
+  do not;
+- debounced like a frequency; repeats are no-ops mid-retune (A16).
+A second dongle appearing is used at the next switch: the press of GS starts
+the glide slope on its own dongle instead, and `gsshared` goes 1 → 0.
+
+**Wire, v2.4** (`docs/RB-VOR-IF-v2.4.md`, `IF_VERSION`): seven `gs*` fields
+(`gsstatus`, `gsdev` + = fly up and 0 unless usable, `gsddm`, `gssdm`,
+`gssnr`, `gsfreqactive`, `gsshared`), on every payload only with
+`gs.enabled`; without it the wire is v2.3 byte for byte (tested against a
+config with no `gs` block). One POST carries everything, two receivers too.
+Mock bridge validates v2.4 including the cross-field rules and scripts the
+switch (`gs=1@10`). Deadbands as A38 in glide-slope units.
+
+Publish rate (A38's method): LOC + GS on two receivers **152 POSTs/min at
+10 dB** against 76 for the localizer alone; 19–25/min at 20–30 dB. Each chain
+posts its own changes. Not coalesced: it would delay the marker by up to a hop
+(O39).
+
+Logs: `gs.csv` with its own schema (`GS_SOLUTION_SCHEMA`, adds the paired
+localizer channel, `shared` and `acquired_hz`); `--csv` gains a `-gs.csv`
+twin; `docs/cloud-schema.md` regenerated. ~~IQ recording stays nav-only.~~
+**Superseded by A46.**
+`vor_replay.py` picks the glide-slope decoder from a sidecar on a glide-path
+channel (`--navaid gs`); `vor_capture.py` accepts the 40 glide-path channels;
+the daemon replays a glide-path capture as its ILS with GS selected. Self-test
+gains a glide-slope stage (decode at +16.75 kHz, invalid on noise) and an
+allocation line.
+
+End to end through the real `_run()` against the live mock bridge at 2 Hz
+(`tests/test_gs_e2e.py`): one dongle switching GS and back (tunes
+LOC, GS, LOC — one each), and two dongles listed by serial in the reverse of
+USB order, both axes TRACKING together. Suite: 1082 collected, 1082 passed;
+ruff clean. **Not run:** roastbeef's `test_vor_radio.py` (phase B has not
+started; the plate does not read `gs*` yet), and anything on a Pi or a real
+dongle.
+
+### A45 — a glide slope that hears nothing says so (2026-11-13)
+Found writing the open items, not by a test. A30 records that a dongle pulled
+during reception is not handled: the reader loops on read errors, no window
+comes, and the controller keeps its last state. For the glide slope that is a
+**usable `gsstatus` and the last `gsdev` left on the bridge** for as long as
+the silence lasts — a stale marker presented as valid. `GsReceiver.tick` now
+drops to NO_SIGNAL ("no samples from the glide-slope dongle", `gsdev` 0) after
+3 s without a window while decoding (six hops; well clear of the first window
+after a retune). Tested for both arrangements. **The nav side keeps the A30
+gap** (O35): the same check there changes the VOR/LOC state machine the G0
+fingerprints pin, which this work was not to touch.
+
+### A46 — the glide slope records its own IQ (2026-11-14)
+Asked for by Stefano. A44 kept IQ recording nav-only, so a glide-slope flag
+wrote nothing, and on one dongle with GS selected nothing was recorded at all.
+
+`GsReceiver` takes an optional `recorder`: a **second** `RingRecorder`, built
+by the daemon only when `record.enabled` and `gs.enabled` are both set, with
+the same `dir`, `format` and `max_seconds`. It is fed whatever the glide slope
+decodes from — its own dongle, or the nav dongle lent on GS select — so GS
+samples never enter the nav ring. `start()` resets it and sets the glide-path
+channel, so a capture is named `capture_<utc>_332600.cu8` and its sidecar
+places the carrier. A glide-slope flag triggers it (`on_flag` only, D6), the
+sidecar note starts "glide slope:", and `gs.csv` gains an `iq_ref` column
+(`GS_SOLUTION_SCHEMA`, still `/1`: the glide slope has never shipped enabled).
+
+Cost: with two receivers, a second ring of up to 61 MB (30 s of cu8) in RAM,
+and both can write at once. On one dongle only one ring fills at a time. O18
+(total disk over a flight) applies twice. Tests in
+`tests/test_gs_controller.py`: a dedicated-dongle flag, a shared-dongle flag
+(nav ring untouched), and a good glide slope writing nothing, with an empty
+ring after a retune. Suite 1085 passed; ruff clean. Not run on a Pi.
+
+### A47 — automatic gain within a configured range (2026-11-20)
+Asked for by Stefano after F7. Optional `sdr.auto_gain` (`enabled`, `min_db`,
+`max_db`, tuning keys with defaults in `rbvor/gainctl.py`), also allowed per
+tuner in `tuner_profiles` (replacing the block's as a whole: an FC0012's
+ladder is not an R820T's). **Shipped disabled** (pinned by
+`test_the_shipped_config_carries_automatic_gain_disabled`); absent or disabled,
+`set_gain` is never called (tested).
+
+**What it optimises is the carrier against the floor, not the noise.** Under
+F7's overload less gain is better; with the receiver's own noise as the floor,
+more is. Which applies is found by trying: once per `eval_s` (1 s) the reader
+thread measures clipping, ADC RMS and carrier/floor (16384-point averaged
+spectrum, peak within `search_hz` of where the carrier belongs over the median
+20–150 kHz either side), and `GainController` applies, in order: clipping
+≥ `clip_severe_pct` (5 %) → two steps down, even while tracking; tracking →
+nothing else; a probe in progress → kept if carrier/floor rose ≥ `improve_db`
+(1 dB) without clipping, else undone and the direction turned; clipping
+≥ `clip_max_pct` (1 %), or no carrier and RMS > `rms_high_counts` → down;
+no carrier and RMS < `rms_low_counts` (4) → up; a carrier and `probe_s` (30 s)
+since the last probe → probe one step. The first period after any change is
+not judged. VHF and UHF remember their own gains (a shared nav/GS dongle).
+
+**Policy from the state** (`controller.gain_policy_for`): TRACKING "protect",
+ACQUIRING / NO_SIGNAL / DEGRADED "free", anything else "hold". A step costs
+the windows that span it, so it is not done to a good bearing.
+
+**A step is not an overrun.** The block after a step carries
+`sdr.GAIN_STEP` — truthy, so the demodulator poisons the window as for any gap
+— and the controller drops `ceil((integration_s + settle_s) / hop_s)` windows
+silently instead of entering NO_SIGNAL (F9 stands for real gaps; both cases
+tested on a synthetic VOR, a 6 dB step mid-track). The ring keeps the samples
+of a step (they are continuous); sidecars now record the gain in force
+(`RingRecorder.gain_source`), which also fixes F7's `gain_db: null`.
+Not done on the glide-slope receiver: there a severe-clipping step reads as one
+overrun window.
+
+Three defects found by measuring, before any field use:
+- the first closed-loop run against F7's FM-overload model cycled every 2.5 s:
+  at the best gain the ADC is nearly idle and the idle rule stepped up again.
+  The idle rule now applies only with no carrier in view (regression test);
+- `carrier_min_db` 10 → **6**: at 10 the loop stopped with a 5.8 dB carrier
+  it could have improved. Noise alone, 15 averaged spectra per second as
+  live: mean peak 3.3 dB, worst 4.2 dB over 30 one-second periods (the test
+  asserts < 4.5). **Under 2 dB of margin** — if probing on noise shows up in
+  the journal, raise it or `eval_s`;
+- `rms_high_counts` 40 → **20**: a no-carrier ADC at 20–40 counts fired no
+  rule, and the loop stalled at 38.6 dB on the model — exactly 11-14's VOR
+  (28–55 counts, 0.2 % clipping). Under FM overload the carrier appears before
+  the level falls to 20; with an external floor, 4–20 counts costs nothing.
+- and a wiring one: built in `open()`, the controller never started for a
+  reader handed a device; it is now built at the first tune of each device.
+
+Measured on the physical model of F7 (16 Msps FM stations through a Rapp
+LNA, IF filter, 8-bit ADC; session scratchpad): from 40.2 dB, 30 % clipping and
+no carrier, it reaches 28.0 dB in ~9 s with the carrier **35 dB** over the
+floor, then only tries and undoes probes; a weak VOR on a quiet band stays put
+(probes do not help); no station climbs to `max_db`. **Not run on a dongle,
+a Pi or in the air** — the model's FM levels and LNA are assumed. Suite 1121
+passed (1085 + 36 in `tests/test_gainctl.py`); ruff clean.
+
 ---
 
 ## Decisions (continued)
@@ -1232,6 +1530,19 @@ The cost: a station transmitting less than 0.40 over-reads (0.36 → +10.7 %
 at full scale), i.e. errs towards *more* deviation. The SDM is published
 (`locsdm`) and the raw DDM logged, so either can be re-derived.
 
+### D10 — glide slope: what was decided rather than measured (2026-11-13)
+- **One receiver means a pilot's switch, not alternation** (plan 6.2). A
+  switch costs settle + filter fill + priming + two windows before a needle
+  can be valid, ~1.5–2 s; alternating would leave each needle stale half the
+  time.
+- **A busy GS dongle does not fall back to sharing** (plan 6.1): allocation by
+  presence is predictable, by who-got-there-first is not. Q10.
+- **Allocation is re-read at every tune attempt**, never per block.
+- **`gsselect` is edge-triggered** — the only way to make "a new station starts
+  on LOC" survive a bridge that re-asserts its state (A44).
+- **The no-samples check (A45) is on the glide slope only**, so the VOR/LOC
+  state machine stays as fingerprinted.
+
 ### D3 — Python confirmed against the A3 port gate (2026-07-24, M3)
 Full chain at 1.024 Msps measured at **6.5 % of one core** in this container
 (15.5× realtime), against the A3 threshold of 25 %. The gate stays open;
@@ -1434,6 +1745,56 @@ Causes, after the config was confirmed:
   a flight this length against the 17 GB free. D6 bounds the rate, not the
   total (O18).
 
+### F7 — flights 2026-11-14 and 11-20: broadcast FM overloads the VHF front end (2026-11-20)
+Data: `../roastbeef/test-data/20261114/` (FC0012 at 19.2 dB, from the journal;
+232 captures) and `../roastbeef/test-data/20261120/` (new dongle and antenna,
+tuner and gain unrecorded; 34 of the 93 captures `vor.csv` names were copied,
+pair them by size, not name). Analysis scripts lived in the session
+scratchpad; the method is what matters.
+
+**What decoded.** The 11-20 glide slope, 330.65 MHz, on the nav dongle shared:
+SDM 0.775 / 0.778, tone SNR 48–51 dB, `gsstatus` 5, DDM ≈ +0.20 (fly up) with
+the aircraft ~16.5 km south of LIRZ at ~2.4° elevation — sign consistent,
+magnitude unverified (GS position and path angle unknown). **Two-frequency**:
+course carrier +3.88 kHz, clearance −4.12 kHz 12 dB down; A41's search locked
+the course carrier. First real data for O31/O36. Nothing else decoded on
+either flight: VOR and localizer AM 0.007–0.009, carrier 1–7 dB over the floor
+in a 125 Hz bin against 23 dB in the April car capture; the 11-14 glide slope
+(FC0012) also buried.
+
+**Fingerprints of the VHF noise** (raw ADC, per capture): RMS 37–75 counts,
+clipping 0.2–12 % (11-14 VOR / 11-20 VOR); stationary, Gaussian, clipping not
+clustered (not impulsive); flat across ±512 kHz; on 11-20 the same dongle at
+the same gain gave **RMS 8 at 330 MHz against 75 at 109 MHz** (19 dB). A weak
+(0.1–0.5 dB) modulation at **exactly 2.000 × engine revolution rate** in 97 %
+of 195 captures (EMS `enginerpm`): four-cylinder firing or a two-blade
+propeller, not separable here. Inside the noise, FM-demodulated, the **19 kHz
+stereo pilot**: 3–6 dB VOR, 8 dB LOC (11-20), 12–15 dB LOC (11-14 10:43); none
+at UHF, none in the car. Where the pilot was strong the noise was higher
+(LOC 70–73 vs 57–59 counts). One FM-demodulated slice measures like programme
+audio (low-band +9.3 dB vs +4.8 for noise; 2–8 Hz envelope share 0.37 vs 0.20).
+
+**Simulated root causes**, each scaled to the observed level: bad antenna —
+cannot reach it (adds no noise); ignition / alternator impulses — kurtosis in
+the hundreds, clustered clipping, ragged spectrum: ruled out as the bulk;
+cabin EMI on a poorly grounded coax — fits the statistics, not the pilot;
+**broadcast FM intermodulation in the LNA** (FM 7–14 dB below saturation) —
+fits every fingerprint, VHF-only, clean at the car's low gain, and predicts the
+carrier back from ~1 to 16–20 dB with 6–10 dB less gain (IM falls 3 dB per dB,
+the VOR 1). ~~"Lower gain alone won't help"~~ — said first in the session from
+a test of ADC clipping only (which costs < 1 dB); wrong when the overload is
+upstream of the ADC.
+
+Not established: a transmitter's spurious emission in the band would also
+carry the pilot and does not respond to receiver gain — the gain sweep
+separates the two. Remedies: an 88–108 MHz band-stop at the dongle (checked
+for loss at 108–112 and 329–335 MHz), a gain sweep (O19), and automatic gain
+(A47). Also seen: after a daemon restart at 08:09:53 the ADC sat at 0.4 counts
+with no carrier (cause not in the data; the journal of that run is needed),
+the AFC wandered to +3…+66 kHz on noise on both flights (A25 says noise never
+triggers it), and sidecars carry a frozen `utc` (the template's daemon-start
+time), `tool_version 0.9.0`, and `gain_db` null — the last fixed by A47.
+
 ---
 
 ## Open questions to Stefano ~~(block M7 only)~~
@@ -1448,6 +1809,13 @@ Causes, after the config was confirmed:
 | Q6 | Is a ground capture near an ILS runway possible before the aircraft receiver is fixed, and where? | L7 waits (O23) |
 | Q7 | Licence for this repo (the `LICENSE` TODO)? | no GPL code ported; the localizer was written from Annex 10 and measurement |
 | Q8 | Phase B hides the VOR plate's deviation bar in VOR mode too: it was always drawn centred there (a constant 0, never a deviation), which looks like "on course". Keep it hidden? | hidden; the bar is drawn only for a localizer with `locstatus >= 4` |
+| Q9 | `2cb8d0f` commits `loc.enabled: true` while a test pins false, so HEAD fails it; the working tree reverts to false, uncommitted. Commit the revert? | left as found (A39) |
+| Q10 | With two dongles listed and the GS one busy (the radio), should the glide slope fall back to sharing the nav dongle? | no: GS shows NO SDR, LOC continues (D10) |
+| Q11 | How are NAV / GS / radio dongles kept from Stratux's automatic assignment: a reserved serial prefix skipped by `configDevices()`? Which prefix? | plain serials in `sdr.devices`; H3 waits (O38) |
+| Q12 | Should the RB-01 settings page edit `sdr.devices`? | file only |
+| Q13 | Should the LOC / GS switch also arbitrate VOR/ILS against the SDR radio, replacing A30's first-come rule? | LOC ↔ GS only; A30 unchanged |
+| Q14 | Field names and senses of RB-VOR-IF v2.4 (`gsdev` + = fly up, `gsselect`, `gsshared`) as RB-01 should consume them? | as written |
+| Q15 | Which dongle and antenna will serve the glide slope in the aircraft — a third dongle on the VOR antenna through a splitter, or its own antenna? | none assumed; plan 9 step 1 decides (O33) |
 
 ## Open technical items
 

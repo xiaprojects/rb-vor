@@ -277,12 +277,20 @@ LOC_FIELDS = ["t", "ddm", "ddm_corrected", "m90", "m150", "sdm", "tone_offset",
               "carrier", "noise_est", "snr_db", "carrier_offset_hz", "overrun"]
 
 
-def replay_loc(a, meta) -> int:
-    """Decode a localizer capture (A33) and print a summary."""
+def replay_loc(a, meta, gs: bool = False) -> int:
+    """Decode a localizer capture (A33), or with `gs` a glide-path capture
+    (A39-A44: same modulation, SDM nominal 0.80, full scale 0.175, + = fly up,
+    with the coarse carrier search of A41), and print a summary."""
     from rbvor.loc import DDM_FULL_SCALE, LocDemod, LocDspParams, LocQuality
-
-    d = LocDemod(LocDspParams(fs=meta.sample_rate_hz, offset_hz=meta.tuner_offset_hz,
-                              integration_s=a.loc_integration, hop_s=a.loc_hop))
+    if gs:
+        from rbvor import gs as gsmod
+        DDM_FULL_SCALE = gsmod.DDM_FULL_SCALE                        # noqa: N806
+        d = gsmod.GsDemod(gsmod.GsDspParams(
+            fs=meta.sample_rate_hz, offset_hz=meta.tuner_offset_hz,
+            integration_s=a.loc_integration, hop_s=a.loc_hop, acquire_hz=30_000.0))
+    else:
+        d = LocDemod(LocDspParams(fs=meta.sample_rate_hz, offset_hz=meta.tuner_offset_hz,
+                                  integration_s=a.loc_integration, hop_s=a.loc_hop))
     obs = []
     for blk in iq_blocks(a.file, block_samples=a.block, meta=meta):
         obs += d.push(np.conj(blk) if a.swap_iq else blk)
@@ -290,7 +298,11 @@ def replay_loc(a, meta) -> int:
         print(f"{a.file}: only {len(obs)} windows -- capture too short", file=sys.stderr)
         return 1
     kept = [o for o in obs[a.skip:] if not o.overrun]
-    q = LocQuality()
+    if gs:
+        from rbvor.gs import GsQualityParams
+        q = LocQuality(GsQualityParams())
+    else:
+        q = LocQuality()
     verdicts = [q.update(o, o.ddm_corrected) for o in kept]
     valid = sum(not v.flagged for v in verdicts)
     if a.csv:
@@ -309,24 +321,32 @@ def replay_loc(a, meta) -> int:
     print(f"source          {'synthetic' if meta.synthetic else 'live'}  "
           f"{meta.station} {meta.site} {meta.notes}".rstrip())
     print(f"fs {meta.sample_rate_hz/1e3:g} kHz  offset {meta.tuner_offset_hz/1e3:+g} kHz  "
-          f"nav {meta.nav_freq_hz/1e6:.3f} MHz  ILS LOCALIZER")
+          f"nav {meta.nav_freq_hz/1e6:.3f} MHz  "
+          f"{'ILS GLIDE SLOPE' if gs else 'ILS LOCALIZER'}")
     print(f"windows         {len(obs)} total, {a.skip} skipped, "
           f"{len(obs) - a.skip - len(kept)} overrun, {len(kept)} used  "
           f"({a.loc_integration:g} s window, {a.loc_hop:g} s hop)")
     print()
     print(f"  DDM             {ddm.mean():+8.4f}   std {ddm.std():.4f}   "
           f"({100 * ddm.mean() / DDM_FULL_SCALE:+.0f} % of full scale; "
-          "+ = 150 Hz = fly left)")
+          f"+ = 150 Hz = {'below the path, fly up' if gs else 'fly left'})")
     print(f"  raw m150 - m90  {np.mean([o.ddm for o in kept]):+8.4f}   "
-          "(before the compression correction, D9)")
-    print(f"  SDM             {np.mean([o.sdm for o in kept]):8.3f}   nominal 0.40")
+          f"(before the compression correction, {'A42' if gs else 'D9'})")
+    print(f"  SDM             {np.mean([o.sdm for o in kept]):8.3f}   "
+          f"nominal {0.80 if gs else 0.40:.2f}")
     print(f"  tone SNR        {np.mean([o.snr_db for o in kept]):8.1f} dB")
     print(f"  tone offset     {100 * np.mean([o.tone_offset for o in kept]):+8.2f} %  "
           "(Cat I allows +/-2.5 %)")
     afc = kept[-1].carrier_offset_hz
     if abs(afc) >= 50 and meta.nav_freq_hz:
         print(f"  carrier offset  {afc:+8.0f} Hz  ({afc / meta.nav_freq_hz * 1e6:+.1f} ppm)")
-    print(f"  valid windows   {valid} of {len(kept)} (LocQuality defaults)")
+    if gs:
+        found = (f"found {d.acquired_hz:+.0f} Hz" if d.acquired_hz
+                 else "nothing above threshold")
+        print(f"  carrier search  {found}  (peak {d.acquire_peak_db:.1f} dB over the "
+              "median; A41)")
+    print(f"  valid windows   {valid} of {len(kept)} "
+          f"({'GsQualityParams' if gs else 'LocQuality'} defaults)")
     syn = meta.synthetic or {}
     if "ddm" in syn:
         print()
@@ -382,7 +402,7 @@ def main(argv=None) -> int:
                     help="decode BOTH spectral senses and report which one works, "
                          "then continue with the winner. This is the test for "
                          "'does my dongle need swap_iq' (A28/O21)")
-    ap.add_argument("--navaid", choices=("auto", "vor", "loc"), default="auto",
+    ap.add_argument("--navaid", choices=("auto", "vor", "loc", "gs"), default="auto",
                     help="decode as VOR or localizer; auto = from the sidecar "
                          "frequency (A33)")
     ap.add_argument("--loc-integration", type=float, default=1.0,
@@ -409,7 +429,10 @@ def main(argv=None) -> int:
         print_survey(s, meta)
         print()
 
-    from rbvor.freqrules import is_loc_frequency
+    from rbvor.freqrules import gs_channels, is_loc_frequency
+    if a.navaid == "gs" or (a.navaid == "auto"
+                            and int(round(meta.nav_freq_hz / 1000)) in gs_channels()):
+        return replay_loc(a, meta, gs=True)
     if a.navaid == "loc" or (a.navaid == "auto"
                              and is_loc_frequency(meta.nav_freq_hz / 1e6)[0]):
         return replay_loc(a, meta)

@@ -54,6 +54,9 @@ __all__ = [
     "is_loc_frequency",
     "vor_channels",
     "loc_channels",
+    "GS_PAIRING_KHZ",
+    "gs_channel_khz",
+    "gs_channels",
 ]
 
 BAND_MIN_KHZ: int = 108_000
@@ -271,6 +274,53 @@ def loc_channels(**kwargs) -> list[int]:
         for ch in range(BAND_MIN_KHZ, BAND_MAX_KHZ + 1, GRID_KHZ)
         if classify_navaid(ch / 1000.0, **kwargs) is NavaidClass.LOC
     ]
+
+
+#: AMENDMENT A39: ILS localizer channel -> paired glide-path channel, kHz
+#: (Annex 10 Vol I 3.1.6.1). Written out from memory, then checked row by row
+#: against a second published copy (RadioReference wiki, "Instrument Landing
+#: System (ILS) Frequencies", with the TACAN channel of each pair) and the
+#: FAA AIM "Frequency Pairs Allocated for ILS" as quoted by a search result:
+#: all 40 agree. NOT checked against Annex 10 Vol I 3.1.6.1 itself (O31).
+#: A wrong row tunes another runway's glide path -- a valid-looking vertical
+#: needle -- so tests/test_gs_freqrules.py holds a second, independent copy.
+GS_PAIRING_KHZ: dict[int, int] = {
+    108_100: 334_700, 108_150: 334_550, 108_300: 334_100, 108_350: 333_950,
+    108_500: 329_900, 108_550: 329_750, 108_700: 330_500, 108_750: 330_350,
+    108_900: 329_300, 108_950: 329_150,
+    109_100: 331_400, 109_150: 331_250, 109_300: 332_000, 109_350: 331_850,
+    109_500: 332_600, 109_550: 332_450, 109_700: 333_200, 109_750: 333_050,
+    109_900: 333_800, 109_950: 333_650,
+    110_100: 334_400, 110_150: 334_250, 110_300: 335_000, 110_350: 334_850,
+    110_500: 329_600, 110_550: 329_450, 110_700: 330_200, 110_750: 330_050,
+    110_900: 330_800, 110_950: 330_650,
+    111_100: 331_700, 111_150: 331_550, 111_300: 332_300, 111_350: 332_150,
+    111_500: 332_900, 111_550: 332_750, 111_700: 333_500, 111_750: 333_350,
+    111_900: 331_100, 111_950: 330_950,
+}
+
+
+def gs_channel_khz(loc_khz: int | None) -> int | None:
+    """The glide-path channel paired with a localizer channel, or None (A39).
+
+    Pure table lookup on the integer kHz channel, deliberately ignorant of
+    allow/deny lists: whether the localizer may be tuned is `is_loc_frequency`'s
+    question, and this one is only "which glide path belongs to it".
+    Not every localizer has a glide path; the table cannot know which do.
+
+    >>> gs_channel_khz(109_500)
+    332600
+    >>> gs_channel_khz(109_400) is None
+    True
+    """
+    if loc_khz is None:
+        return None
+    return GS_PAIRING_KHZ.get(int(loc_khz))
+
+
+def gs_channels() -> list[int]:
+    """All 40 glide-path channels in kHz, ascending (329150..335000)."""
+    return sorted(GS_PAIRING_KHZ.values())
 
 
 def vor_channels(**kwargs) -> list[int]:

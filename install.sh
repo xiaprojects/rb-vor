@@ -14,7 +14,7 @@
 set -euo pipefail
 
 PREFIX=/opt/addons/rb-vor
-CONFDIR=/boot/firmware/rb/rb-vor.json
+CONFDIR=/boot/firmware/rb
 USER_NAME=rb-vor
 UNIT=rb-vor.service
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

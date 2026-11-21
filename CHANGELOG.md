@@ -1,3 +1,57 @@
+## Unreleased — automatic gain within a configured range, shipped disabled (CLAUDE.md A47, F7) — 2026-11-20
+
+- **Automatic tuner gain** (`sdr.auto_gain`: `enabled`, `min_db`, `max_db`;
+  also per tuner in `tuner_profiles`). Off by default; with it absent or off,
+  the gain is fixed exactly as before. It moves the gain to maximise the
+  carrier against the floor, not to minimise noise: under broadcast-FM
+  overload (the 2026-11-14 and 11-20 flights, F7) that means less gain. Steps
+  down on ADC clipping (two steps even while tracking above 5 %); while not
+  tracking, probes one step and keeps it only if the carrier rose against the
+  floor; with no carrier in view keeps the ADC between 4 and 20 counts RMS.
+  VHF and UHF remember their own gains on a shared nav/GS dongle.
+- A gain step drops the windows that span it **without** entering NO_SIGNAL;
+  a real sample gap still does (F9).
+- Every step is logged (`automatic gain: 40.2 -> 37.2 dB, ADC clipping 29.8 %
+  (...)`); the gain in force is in the status line and in **every capture
+  sidecar** (`gain_db` was always null before).
+- New: `rbvor/gainctl.py`, `tests/test_gainctl.py`.
+
+## Unreleased — ILS glide slope and more than one SDR, phase A, shipped disabled (CLAUDE.md A39–A45, D10) — 2026-11-13
+
+- **ILS glide-slope decoding**, off by default (`"gs": {"enabled": false}`;
+  requires `loc.enabled`). Picking a localizer selects its paired glide path
+  (40-row table, checked against two published copies, not yet against Annex
+  10 itself: O31). Measured on synthetic signals only (`docs/gs-sweep.md`);
+  stays off until a real glide slope has been decoded (plan G8).
+  Supplemental, not approach guidance; false glide paths cannot be detected.
+- **One dongle or several** (`sdr.devices`): with two, localizer and glide
+  slope are received together; with one, the pilot switches LOC / GS
+  (`gsselect`) and the half not selected goes dark in the same POST. The
+  allocation is re-read at every retune, so hot-plugged dongles are used;
+  dongles not listed are never opened. Without `sdr.devices` the single-dongle
+  selection is exactly as before. `python3 -m rbvor --devices` shows the
+  allocation.
+- **RB-VOR-IF v2.4** (`docs/RB-VOR-IF-v2.4.md`): seven `gs*` fields —
+  `gsstatus`, `gsdev` (+ = fly up, **0 unless `gsstatus >= 4`**), `gsddm`,
+  `gssdm`, `gssnr`, `gsfreqactive`, `gsshared` — only with `gs.enabled`;
+  without it the wire is byte-for-byte v2.3. Consumed: `gsselect`.
+- **A lawful glide path at the carrier limit is heard.** 0.005 % is 16.75 kHz
+  at 335 MHz, outside the 13 kHz channel filter: the localizer front end lost
+  it from 14 kHz. A coarse carrier search before the filter recovers every
+  offset to ±28 kHz (A41), and keeps searching while nothing is found.
+- **Noise is never a usable ILS**: 0 of 1120 noise-only windows pass, and no
+  usable status through the state machine with noise on one or both
+  receivers; each axis fails alone. A glide-slope dongle that goes silent
+  drops to no-signal within 3 s instead of leaving its last marker (A45).
+- New: `rbvor/gs.py`, `tools/gs_gen.py`, `tools/gs_sweep.py`; `vor_replay.py`
+  decodes a glide-path capture from its sidecar frequency; `vor_capture.py`
+  accepts glide-path channels; self-test glide-slope stage; `mock_bridge.py`
+  validates v2.4 and scripts the switch (`gs=1@10`); glide-slope solutions in
+  their own `gs.csv`.
+- VOR and localizer unchanged: every existing test passes unmodified and nine
+  bit-level fingerprints (real capture, synthetic VOR and localizer, payloads
+  through the controller) are identical before and after.
+
 ## Unreleased — ILS localizer, phase A, shipped disabled (CLAUDE.md A33–A38, D9) — 2026-11-10
 
 - **ILS localizer decoding**, off by default (`"loc": {"enabled": false}`).
