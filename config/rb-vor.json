@@ -103,7 +103,7 @@
     "denylist_mhz": []
   },
   "record": {
-    "enabled": false,
+    "enabled": true,
     "dir": "/var/log/rb-vor",
     "format": "cu8",
     "max_seconds": 30,
@@ -114,11 +114,11 @@
     "solution_csv": "/var/log/rb-vor/vor.csv"
   },
   "loc": {
-    "enabled": false,
+    "enabled": true,
     "_note": "ILS localizer (CLAUDE.md A33-A37, D9; RB-VOR-IF v2.3). Off until a real localizer has been decoded (docs/loc-plan.md L7). Every other loc key is optional with defaults in rbvor/config.py LOC_DEFAULTS."
   },
   "gs": {
-    "enabled": false,
+    "enabled": true,
     "_note": "ILS glide slope (CLAUDE.md A39-A45; RB-VOR-IF v2.4; docs/gs-plan.md). Requires loc.enabled. Off until a real glide slope has been decoded (plan G8). Supplemental, not approach guidance. Every other gs key is optional with defaults in rbvor/config.py GS_DEFAULTS. Two dongles: list them in sdr.devices."
   }
 }
